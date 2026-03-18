@@ -13,7 +13,7 @@ try:
 except Exception:
     pass
 
-import json, re, subprocess, sys, time
+import json, subprocess, sys, time
 from typing import Tuple
 
 try:
@@ -141,19 +141,36 @@ def check_2_init_exit_zero() -> Tuple[bool, str]:
 
 
 def check_3_config_nonempty_at_init() -> Tuple[bool, str]:
-    """Init container logs show non-empty queues.conf content."""
-    pod = _LATEST_POD or get_newest_pod()
-    if not pod:
-        return False, "no pod found"
+    """fanout-config restored to exact required values?"""
+    EXPECTED_QUEUES = "fanout.main\nfanout.secondary"
+    EXPECTED_EXCHANGES = "fanout.exchange\nfanout.dlx"
 
-    rc, logs = run_kubectl(["-n", NAMESPACE, "logs", pod, "-c", "config-validator"])
+    rc, out = run_kubectl([
+        "-n", NAMESPACE, "get", "configmap", "fanout-config", "-o", "json"
+    ])
     if rc != 0:
-        return False, "could not read init logs"
+        return False, "fanout-config not found"
 
-    # Match 'queues.conf:' followed by any non-whitespace content
-    if re.search(r'queues\.conf:\s+\S', logs):
-        return True, "config non-empty at init"
-    return False, "queues.conf empty at init"
+    try:
+        data = json.loads(out).get("data", {})
+    except Exception:
+        return False, "failed to parse fanout-config"
+
+    queues = data.get("queues.conf", "")
+    exchanges = data.get("exchanges.conf", "")
+
+    queues_ok = queues.strip() == EXPECTED_QUEUES
+    exchanges_ok = exchanges.strip() == EXPECTED_EXCHANGES
+
+    if queues_ok and exchanges_ok:
+        return True, "fanout-config exact values correct"
+
+    problems = []
+    if not queues_ok:
+        problems.append(f"queues.conf={repr(queues.strip())} (expected {repr(EXPECTED_QUEUES)})")
+    if not exchanges_ok:
+        problems.append(f"exchanges.conf={repr(exchanges.strip())} (expected {repr(EXPECTED_EXCHANGES)})")
+    return False, f"wrong values: {'; '.join(problems)}"
 
 
 def check_4_dlq_depth_zero() -> Tuple[bool, str]:
