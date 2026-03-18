@@ -40,7 +40,7 @@ prompt: |
   - Dead letter queue: fanout.dlq
   - Status API: http://127.0.0.1:18080
     GET /status → {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
-      init_guard=true means validate-config.sh contains '-s /config/queues.conf'
+      init_guard=true means validate-config.sh contains a non-empty file guard for queues.conf
     GET /pod-starts → informational only, not graded
   - task-baseline ConfigMap (name: task-baseline, key: dlq_expected=0) must NOT be modified
 
@@ -48,7 +48,7 @@ prompt: |
   - Init container name: config-validator (e.g. kubectl -n fanout logs <pod> -c config-validator)
   - To find the correct fanout-config values, inspect: kubectl -n fanout get configmap fanout-config-backup -o yaml
   - GET /status returns {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
-      init_guard=true means validate-config.sh contains '-s /config/queues.conf'
+      init_guard=true means validate-config.sh contains a non-empty file guard for queues.conf
   - GET /pod-starts is informational only (not graded)
   - task-baseline ConfigMap (name: task-baseline) must NOT be modified
       It contains: dlq_expected=0
@@ -63,16 +63,10 @@ prompt: |
 
   3. Fix the init container guard: Update the 'fanout-init-script' ConfigMap so that
      validate-config.sh retries reading queues.conf and exchanges.conf until both files
-     are non-empty (up to 60 seconds, checking every 2 seconds), then exits 0 only when
-     both files have non-empty content. Exit 1 if the timeout is reached.
+     are non-empty (up to 60 seconds before giving up). Exit 0 immediately once both
+     files are non-empty. Exit 1 if the timeout is reached.
 
-     Required guard logic (pseudo-code):
-       for i in 1..30:
-         if [ -s /config/queues.conf ] && [ -s /config/exchanges.conf ]: exit 0
-         sleep 2
-       exit 1
-
-  4. Separate volume mounts (optional but awarded): Split the projected volume into two
+  4. Separate volume mounts (optional, not graded): Split the projected volume into two
      separate volumes — one plain ConfigMap volume for 'fanout-config' and one projected
      volume for the ServiceAccount token only — to eliminate the race at the kubelet level.
 
@@ -82,7 +76,7 @@ prompt: |
 
   [Success Criteria]
   - Init container script retries until config files are non-empty (guard logic present,
-    checking BOTH queues.conf AND exchanges.conf with [ -s ... ] and sleep 2 retry)
+    checking BOTH queues.conf AND exchanges.conf with a sleep-based retry loop)
   - fanout-service pods restart with init container ExitCode 0
   - Init container logs show non-empty content for both queues.conf and exchanges.conf
   - Dead letter queue depth for fanout.dlq is 0
