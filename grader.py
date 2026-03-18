@@ -124,6 +124,26 @@ def check_4_trigger_blocks_delete() -> Tuple[bool, str]:
     if not ok or res != "0":
         return False, f"old functions: {res}"
     
+    ok, res = psql("SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE 'legacy_%'")
+    if not ok or res != "0":
+        return False, f"old trigger objects remain: {res}"
+    
+    # Functional test: attempt DELETE on a service_group that has incidents
+    ok, gid = psql("SELECT service_group_id FROM statping_task.incidents WHERE service_group_id IS NOT NULL LIMIT 1")
+    if ok and gid:
+        try:
+            gid_int = int(gid)
+        except (ValueError, TypeError):
+            return False, "invalid service_group_id"
+        ok_del, del_out = psql(f"DELETE FROM statping_task.service_groups WHERE id = {gid_int}")
+        # DELETE should fail (rc != 0 means exception was raised = trigger worked)
+        if ok_del:
+            return False, "trigger did not block DELETE"
+        # Confirm row still exists
+        ok_chk, cnt = psql(f"SELECT COUNT(*) FROM statping_task.service_groups WHERE id = {gid_int}")
+        if not ok_chk or cnt != "1":
+            return False, "service_group was deleted (trigger failed)"
+    
     return True, "trigger enforces"
 
 def check_5_concurrency() -> Tuple[bool, str]:
