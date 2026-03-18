@@ -8,60 +8,86 @@ NAMESPACE="fanout"
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 echo "[✓] Namespace $NAMESPACE ready"
 
-# ── 2. Deploy RabbitMQ ───────────────────────────────────────────────────────
-kubectl -n "$NAMESPACE" apply -f - <<'EOF'
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: rabbitmq
-  namespace: fanout
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: rabbitmq
-  template:
-    metadata:
-      labels:
-        app: rabbitmq
-    spec:
-      containers:
-      - name: rabbitmq
-        image: rabbitmq:3.12-management
-        ports:
-        - containerPort: 5672
-        - containerPort: 15672
-        env:
-        - name: RABBITMQ_DEFAULT_USER
-          value: guest
-        - name: RABBITMQ_DEFAULT_PASS
-          value: guest
-        readinessProbe:
-          httpGet:
-            path: /api/overview
-            port: 15672
-          initialDelaySeconds: 20
-          periodSeconds: 5
-          timeoutSeconds: 5
-          failureThreshold: 12
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: rabbitmq
-  namespace: fanout
-spec:
-  selector:
-    app: rabbitmq
-  ports:
-  - name: amqp
-    port: 5672
-    targetPort: 5672
-  - name: management
-    port: 15672
-    targetPort: 15672
-EOF
-echo "[✓] RabbitMQ Deployment + Service created"
+# ── 2. Start mock RabbitMQ management API (replaces real RabbitMQ — no image needed) ──
+cat > /tmp/mock_rabbitmq.py <<'MOCK_RMQAPI'
+#!/usr/bin/env python3
+"""
+Minimal mock of the RabbitMQ management HTTP API.
+Implements only the endpoints used by setup.sh, grader.py, and the agent.
+DLQ depth starts at 5 (simulating dropped messages); purge sets it to 0.
+"""
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+
+_dlq_depth = 5
+_dlq_lock = threading.Lock()
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _reply(self, code, body=b"", ctype="application/json"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        global _dlq_depth
+        if self.path in ("/api/overview", "/api/overview/"):
+            data = json.dumps({"rabbitmq_version": "3.12.0-mock", "management_version": "3.12.0"}).encode()
+            return self._reply(200, data)
+        if self.path == "/api/queues/%2F/fanout.dlq":
+            with _dlq_lock:
+                depth = _dlq_depth
+            data = json.dumps({"name": "fanout.dlq", "messages": depth, "durable": True}).encode()
+            return self._reply(200, data)
+        self._reply(404, b'{"error":"not_found"}')
+
+    def do_PUT(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        if "fanout.dlq" in self.path:
+            return self._reply(201, b'{}')
+        self._reply(404, b'{"error":"not_found"}')
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length:
+            self.rfile.read(length)
+        if "publish" in self.path:
+            return self._reply(200, b'{"routed":true}')
+        self._reply(404, b'{"error":"not_found"}')
+
+    def do_DELETE(self):
+        global _dlq_depth
+        if "fanout.dlq/contents" in self.path:
+            with _dlq_lock:
+                _dlq_depth = 0
+            return self._reply(204)
+        self._reply(404, b'{"error":"not_found"}')
+
+HTTPServer(("127.0.0.1", 15672), Handler).serve_forever()
+MOCK_RMQAPI
+
+nohup python3 /tmp/mock_rabbitmq.py >/tmp/mock_rmq.log 2>&1 &
+MOCK_RMQ_PID=$!
+
+echo "[*] Waiting for mock RabbitMQ API..."
+for i in $(seq 1 20); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -u guest:guest http://127.0.0.1:15672/api/overview 2>/dev/null || true)
+  [ "$STATUS" = "200" ] && break
+  sleep 1
+done
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+  -u guest:guest http://127.0.0.1:15672/api/overview 2>/dev/null || true)
+[ "$STATUS" = "200" ] || { echo "[!] Mock RabbitMQ API not available" >&2; exit 1; }
+echo "[✓] Mock RabbitMQ management API ready (PID $MOCK_RMQ_PID)"
 
 # ── 3. Create fanout-config ConfigMap ────────────────────────────────────────
 kubectl -n "$NAMESPACE" create configmap fanout-config \
@@ -182,40 +208,14 @@ echo "[✓] Init container log captured: /tmp/fanout_init_log.txt"
 cat > /tmp/fanout_task.env <<EOF
 NAMESPACE=fanout
 RABBITMQ_URL=http://127.0.0.1:15672
+RABBITMQ_HOST=127.0.0.1
+RABBITMQ_PORT=15672
 RABBITMQ_USER=guest
 RABBITMQ_PASS=guest
 EOF
 echo "[✓] Environment written to /tmp/fanout_task.env"
 
-# ── 12. Port-forward RabbitMQ management API ─────────────────────────────────
-echo "[*] Port-forwarding RabbitMQ management port..."
-# Wait for RabbitMQ pod to be ready first
-for i in $(seq 1 60); do
-  RMQP=$(kubectl -n "$NAMESPACE" get pods -l app=rabbitmq \
-    -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
-  [ "$RMQP" = "Running" ] && break
-  sleep 3
-done
-
-kubectl -n "$NAMESPACE" port-forward svc/rabbitmq 15672:15672 \
-  >/tmp/rabbitmq_pf.log 2>&1 &
-PF_PID=$!
-echo "[*] Port-forward PID: $PF_PID"
-
-# Wait for RabbitMQ management API to be available
-echo "[*] Waiting for RabbitMQ management API..."
-for i in $(seq 1 40); do
-  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-    -u guest:guest http://127.0.0.1:15672/api/overview 2>/dev/null || true)
-  [ "$STATUS" = "200" ] && break
-  sleep 3
-done
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-  -u guest:guest http://127.0.0.1:15672/api/overview 2>/dev/null || true)
-[ "$STATUS" = "200" ] || { echo "[!] RabbitMQ management API not available" >&2; exit 1; }
-echo "[✓] RabbitMQ management API ready"
-
-# ── 13. Pre-create fanout.dlq and publish 5 messages (simulate DLQ depth) ───
+# ── 12. Pre-create fanout.dlq and publish 5 messages (simulate DLQ depth) ───
 echo "[*] Creating fanout.dlq queue..."
 curl -s -u guest:guest -X PUT http://127.0.0.1:15672/api/queues/%2F/fanout.dlq \
   -H "content-type: application/json" \
@@ -231,7 +231,7 @@ for i in 1 2 3 4 5; do
 done
 echo "[✓] 5 messages published to fanout.dlq"
 
-# ── 14. Start status API server (ThreadingHTTPServer) ────────────────────────
+# ── 13. Start status API server (ThreadingHTTPServer) ────────────────────────
 cat > /tmp/fanout_api.py <<'PYTHON_API'
 #!/usr/bin/env python3
 import json, subprocess, sys
@@ -315,7 +315,7 @@ curl -sf http://127.0.0.1:18080/status >/dev/null 2>&1 || \
   { echo "[!] Status API server failed to start" >&2; exit 1; }
 echo "[✓] Status API server ready at http://127.0.0.1:18080"
 
-# ── 15. Verify setup ──────────────────────────────────────────────────────────
+# ── 14. Verify setup ──────────────────────────────────────────────────────────
 echo "[*] Verifying setup..."
 kubectl get namespace "$NAMESPACE" >/dev/null
 kubectl -n "$NAMESPACE" get configmap fanout-config >/dev/null
