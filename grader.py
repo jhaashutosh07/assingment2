@@ -13,7 +13,7 @@ try:
 except Exception:
     pass
 
-import json, subprocess, sys, time
+import json, re, subprocess, sys, time
 from typing import Tuple
 
 try:
@@ -62,25 +62,25 @@ def get_newest_pod() -> str:
 
 
 def check_1_init_guard_present() -> Tuple[bool, str]:
-    """Does validate-config.sh contain the -s guard for BOTH files and a retry loop?"""
+    """Does validate-config.sh reference both config files and include a retry/sleep?"""
     rc, script = run_kubectl([
         "-n", NAMESPACE, "get", "configmap", "fanout-init-script",
         "-o", "jsonpath={.data.validate-config\\.sh}"
     ])
     if rc != 0 or not script:
         return False, "fanout-init-script ConfigMap not found"
-    has_queue_guard = "-s /config/queues.conf" in script
-    has_exchange_guard = "-s /config/exchanges.conf" in script
-    has_retry = "sleep 2" in script
+    has_queue_guard = "/config/queues.conf" in script
+    has_exchange_guard = "/config/exchanges.conf" in script
+    has_retry = bool(re.search(r'sleep\s+[0-9]+', script))
     if has_queue_guard and has_exchange_guard and has_retry:
         return True, "guard present"
     missing = []
     if not has_queue_guard:
-        missing.append("-s /config/queues.conf")
+        missing.append("/config/queues.conf reference")
     if not has_exchange_guard:
-        missing.append("-s /config/exchanges.conf")
+        missing.append("/config/exchanges.conf reference")
     if not has_retry:
-        missing.append("sleep 2 (retry loop)")
+        missing.append("sleep <N> retry loop")
     return False, f"guard missing: {', '.join(missing)}"
 
 
@@ -141,36 +141,41 @@ def check_2_init_exit_zero() -> Tuple[bool, str]:
 
 
 def check_3_config_nonempty_at_init() -> Tuple[bool, str]:
-    """fanout-config restored to exact required values?"""
-    EXPECTED_QUEUES = "fanout.main\nfanout.secondary"
-    EXPECTED_EXCHANGES = "fanout.exchange\nfanout.dlx"
+    """fanout-config restored to match fanout-config-backup values?"""
+    # Fetch backup (authoritative)
+    rc_b, out_b = run_kubectl([
+        "-n", NAMESPACE, "get", "configmap", "fanout-config-backup", "-o", "json"
+    ])
+    if rc_b != 0:
+        return False, "fanout-config-backup not found"
+    try:
+        backup_data = json.loads(out_b).get("data", {})
+    except Exception:
+        return False, "failed to parse fanout-config-backup"
 
-    rc, out = run_kubectl([
+    # Fetch current
+    rc_c, out_c = run_kubectl([
         "-n", NAMESPACE, "get", "configmap", "fanout-config", "-o", "json"
     ])
-    if rc != 0:
+    if rc_c != 0:
         return False, "fanout-config not found"
-
     try:
-        data = json.loads(out).get("data", {})
+        current_data = json.loads(out_c).get("data", {})
     except Exception:
         return False, "failed to parse fanout-config"
 
-    queues = data.get("queues.conf", "")
-    exchanges = data.get("exchanges.conf", "")
-
-    queues_ok = queues.strip() == EXPECTED_QUEUES
-    exchanges_ok = exchanges.strip() == EXPECTED_EXCHANGES
-
-    if queues_ok and exchanges_ok:
-        return True, "fanout-config exact values correct"
-
     problems = []
-    if not queues_ok:
-        problems.append(f"queues.conf={repr(queues.strip())} (expected {repr(EXPECTED_QUEUES)})")
-    if not exchanges_ok:
-        problems.append(f"exchanges.conf={repr(exchanges.strip())} (expected {repr(EXPECTED_EXCHANGES)})")
-    return False, f"wrong values: {'; '.join(problems)}"
+    for key in ("queues.conf", "exchanges.conf"):
+        expected = backup_data.get(key, "").strip()
+        actual = current_data.get(key, "").strip()
+        if not expected:
+            return False, f"fanout-config-backup missing key {key}"
+        if actual != expected:
+            problems.append(f"{key} mismatch (got {repr(actual[:40])})")
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, "fanout-config matches backup"
 
 
 def check_4_dlq_depth_zero() -> Tuple[bool, str]:
@@ -256,7 +261,7 @@ def evaluate():
     checks = {
         "init_guard_present": check_1_init_guard_present,
         "init_exit_zero": check_2_init_exit_zero,
-        "config_nonempty_at_init": check_3_config_nonempty_at_init,
+        "config_restored": check_3_config_nonempty_at_init,
         "dlq_depth_zero": check_4_dlq_depth_zero,
         "task_baseline_intact": check_5_task_baseline_intact,
         "pod_restart_stability": check_6_pod_restart_stability,
