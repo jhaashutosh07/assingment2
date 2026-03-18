@@ -34,9 +34,8 @@ prompt: |
     View logs: kubectl -n fanout logs <pod> -c config-validator
   - Init script ConfigMap (you CAN modify this): fanout-init-script
     Key: validate-config.sh
-  - fanout-config MUST be restored to these exact values:
-      queues.conf: "fanout.main\nfanout.secondary"
-      exchanges.conf: "fanout.exchange\nfanout.dlx"
+  - The correct values for fanout-config must be discovered from the environment —
+    inspect the 'fanout-config-backup' ConfigMap for the original values
   - RabbitMQ management API: http://127.0.0.1:15672 (credentials: guest / guest)
   - Dead letter queue: fanout.dlq
   - Status API: http://127.0.0.1:18080
@@ -47,9 +46,7 @@ prompt: |
 
   [Key Environment Facts]
   - Init container name: config-validator (e.g. kubectl -n fanout logs <pod> -c config-validator)
-  - fanout-config expected values:
-      queues.conf: "fanout.main\nfanout.secondary"
-      exchanges.conf: "fanout.exchange\nfanout.dlx"
+  - To find the correct fanout-config values, inspect: kubectl -n fanout get configmap fanout-config-backup -o yaml
   - GET /status returns {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
       init_guard=true means validate-config.sh contains '-s /config/queues.conf'
   - GET /pod-starts is informational only (not graded)
@@ -62,9 +59,7 @@ prompt: |
      condition by observing empty config file content in init container logs.
 
   2. Restore fanout-config: Patch the 'fanout-config' ConfigMap to restore the correct
-     non-empty values:
-       queues.conf: "fanout.main\nfanout.secondary"
-       exchanges.conf: "fanout.exchange\nfanout.dlx"
+     non-empty values — inspect the 'fanout-config-backup' ConfigMap for the original values
 
   3. Fix the init container guard: Update the 'fanout-init-script' ConfigMap so that
      validate-config.sh retries reading queues.conf and exchanges.conf until both files
@@ -89,13 +84,13 @@ prompt: |
   - Init container script retries until config files are non-empty (guard logic present,
     checking BOTH queues.conf AND exchanges.conf with [ -s ... ] and sleep 2 retry)
   - fanout-service pods restart with init container ExitCode 0
-  - Init container logs show non-empty queues.conf content (e.g. "queues.conf: fanout.main...")
+  - Init container logs show non-empty content for both queues.conf and exchanges.conf
   - Dead letter queue depth for fanout.dlq is 0
   - task-baseline ConfigMap (task-baseline) unchanged (dlq_expected must remain "0")
 
 metadata:
   category: platform-eng
-  difficulty: medium
+  difficulty: hard
   domains:
     - configmap-propagation
     - rabbitmq

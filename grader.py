@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Grader - PRIVATE (not accessible to agent)
-fanout-configmap-race: 5 checks, each weighted 0.2
+fanout-configmap-race: 6 checks, each weighted ~0.167
 """
 
 import os
@@ -211,13 +211,55 @@ def check_5_task_baseline_intact() -> Tuple[bool, str]:
     return False, f"task-baseline tampered: dlq_expected={val}"
 
 
+def check_6_pod_restart_stability() -> Tuple[bool, str]:
+    """Trigger a second rolling restart and confirm init container is stable."""
+    # Trigger rolling restart
+    rc, _ = run_kubectl(["-n", NAMESPACE, "rollout", "restart", "deployment/fanout-service"])
+    if rc != 0:
+        return False, "rollout restart failed"
+
+    # Wait for rollout to complete (180s)
+    rc, _ = run_kubectl(
+        ["-n", NAMESPACE, "rollout", "status", "deployment/fanout-service", "--timeout=180s"],
+        timeout=190
+    )
+    if rc != 0:
+        return False, "rollout did not complete"
+
+    pod = get_newest_pod()
+    if not pod:
+        return False, "no pod found after restart"
+
+    # Wait for init container to reach terminated state (30 attempts × 2s = 60s max)
+    exit_code = ""
+    for _ in range(30):
+        rc_ec, exit_code = run_kubectl([
+            "-n", NAMESPACE, "get", "pod", pod,
+            "-o", "jsonpath={.status.initContainerStatuses[0].state.terminated.exitCode}"
+        ])
+        if rc_ec == 0 and exit_code != "":
+            break
+        time.sleep(2)
+
+    if exit_code != "0":
+        return False, f"init exit code after second restart: {exit_code!r}"
+
+    rc_logs, logs = run_kubectl(["-n", NAMESPACE, "logs", pod, "-c", "config-validator"])
+    if "ERROR: config files still empty" in logs:
+        return False, "ERROR in init logs after second restart"
+
+    return True, "stable across restarts"
+
+
 def evaluate():
+    # 6 checks, each weighted ~0.167
     checks = {
         "init_guard_present": check_1_init_guard_present,
         "init_exit_zero": check_2_init_exit_zero,
         "config_nonempty_at_init": check_3_config_nonempty_at_init,
         "dlq_depth_zero": check_4_dlq_depth_zero,
         "task_baseline_intact": check_5_task_baseline_intact,
+        "pod_restart_stability": check_6_pod_restart_stability,
     }
 
     subscores = {}
@@ -232,7 +274,7 @@ def evaluate():
             subscores[name] = 0.0
             feedback.append(f"[{name}] error")
 
-    weights = {k: 0.2 for k in checks}
+    weights = {k: 1/6 for k in checks}
     score = sum(subscores.get(k, 0) * weights[k] for k in checks)
     return subscores, weights, " | ".join(feedback), score
 

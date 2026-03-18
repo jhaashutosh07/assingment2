@@ -98,7 +98,16 @@ fanout.dlx' \
   --dry-run=client -o yaml | kubectl apply -f -
 echo "[✓] fanout-config ConfigMap created"
 
-# ── 4. Create fanout-init-script ConfigMap (broken — no empty-file guard) ───
+# ── 4b. Create fanout-config-backup (correct values — agent must discover this) ──
+kubectl -n "$NAMESPACE" create configmap fanout-config-backup \
+  --from-literal='queues.conf=fanout.main
+fanout.secondary' \
+  --from-literal='exchanges.conf=fanout.exchange
+fanout.dlx' \
+  --dry-run=client -o yaml | kubectl apply -f -
+echo "[✓] fanout-config-backup ConfigMap created"
+
+# ── 5. Create fanout-init-script ConfigMap (broken — no empty-file guard) ───
 kubectl -n "$NAMESPACE" create configmap fanout-init-script \
   --from-literal='validate-config.sh=#!/bin/sh
 # Broken: no guard for empty files
