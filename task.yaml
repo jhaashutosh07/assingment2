@@ -1,0 +1,64 @@
+id: statping-fk-incident
+
+prompt: |
+  [PRODUCTION INCIDENT: Statping-ng Incident Creation Non-Functional]
+  
+  Issue: #678
+  Severity: CRITICAL
+  
+  During a RabbitMQ brownout, on-call engineers cannot create manual incidents to update 
+  the public status page. The incident creation API returns HTTP 500 with database errors.
+  
+  [Root Cause]
+  A maintenance script deleted service_group records directly via SQL (IDs 1, 3, 4), leaving 
+  orphaned incident records. The missing FK constraint allows this broken state. New incidents 
+  cannot be inserted.
+  
+  [Broken State]
+  - Database schema: statping_task
+  - incidents table: 100-200 orphaned references to deleted service_groups + 10-30 NULL values
+  - service_groups table: Only IDs 2 ('valid-group') and 5 ('unreferenced-group') exist
+  - No FK constraint preventing orphaned references
+  - Old protective triggers that don't work properly
+  
+  [API Specification]
+  
+  Base URL: http://127.0.0.1:18080
+  
+  POST /incidents
+    Request:  {"service_group_id": <int>, "summary": <string>}
+    Success:  HTTP 201 {"id": <int>, "service_group_id": <int>, "summary": <string>}
+    Error:    HTTP 500 (constraint violation - BEFORE repair)
+  
+  GET /incidents
+    Response: HTTP 200 [{"id": <int>, "service_group_id": <int>, "summary": <string>}, ...]
+  
+  GET /status
+    Response: HTTP 200 {"status": "ok"}
+  
+  [Your Mission]
+  
+  1. Diagnose: Identify orphaned incidents and why incident creation fails
+  2. Repair: Update all orphaned/NULL incidents to valid service_group IDs (2 or 5)
+     - Use UPDATE only (no DELETE)
+     - Must be atomic transaction
+  3. Protect: Create FK constraint and trigger to prevent future violations
+     - FK: incidents_service_group_id_fkey (ON DELETE RESTRICT, VALIDATED)
+     - Trigger: prevent_service_group_delete function
+     - Trigger: Must block DELETE on service_groups with active incidents
+  4. Cleanup: Remove old broken triggers (legacy_delete_trigger, legacy_block_delete)
+  5. Verify: Test that incident creation works (HTTP 201) and concurrency is safe
+  
+  [Success Criteria]
+  - Incident creation API returns HTTP 201
+  - All orphaned incidents fixed (0 orphans, 0 NULLs)
+  - FK constraint exists and is VALIDATED
+  - Trigger prevents DELETE on service_groups with incidents
+  - Old triggers removed
+  - 10+ concurrent requests succeed within 5 seconds
+  - uptime_history row count unchanged
+
+metadata:
+  category: devops
+  difficulty: hard
+  horizon: "2-3 hours"
