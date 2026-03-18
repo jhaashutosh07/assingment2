@@ -13,7 +13,7 @@ try:
 except Exception:
     pass
 
-import json, subprocess, sys, time
+import json, re, subprocess, sys, time
 from typing import Tuple
 
 try:
@@ -24,6 +24,7 @@ except Exception:
             super().__init__(score=score, subscores=subscores or {}, weights=weights or {}, feedback=feedback)
 
 NAMESPACE = "fanout"
+_LATEST_POD = ""
 
 
 def run_kubectl(args: list, timeout: int = 30) -> Tuple[int, str]:
@@ -61,58 +62,87 @@ def get_newest_pod() -> str:
 
 
 def check_1_init_guard_present() -> Tuple[bool, str]:
-    """Does validate-config.sh contain the -s guard?"""
+    """Does validate-config.sh contain the -s guard for BOTH files and a retry loop?"""
     rc, script = run_kubectl([
         "-n", NAMESPACE, "get", "configmap", "fanout-init-script",
         "-o", "jsonpath={.data.validate-config\\.sh}"
     ])
     if rc != 0 or not script:
         return False, "fanout-init-script ConfigMap not found"
-    if "-s /config/queues.conf" in script:
+    has_queue_guard = "-s /config/queues.conf" in script
+    has_exchange_guard = "-s /config/exchanges.conf" in script
+    has_retry = "sleep 2" in script
+    if has_queue_guard and has_exchange_guard and has_retry:
         return True, "guard present"
-    return False, "guard missing"
+    missing = []
+    if not has_queue_guard:
+        missing.append("-s /config/queues.conf")
+    if not has_exchange_guard:
+        missing.append("-s /config/exchanges.conf")
+    if not has_retry:
+        missing.append("sleep 2 (retry loop)")
+    return False, f"guard missing: {', '.join(missing)}"
 
 
 def check_2_init_exit_zero() -> Tuple[bool, str]:
     """After rolling restart, init container exits 0 and no ERROR in logs."""
-    # Trigger rolling restart
-    rc, _ = run_kubectl(["-n", NAMESPACE, "rollout", "restart", "deployment/fanout-service"])
-    if rc != 0:
-        return False, "rollout restart failed"
+    global _LATEST_POD
 
-    # Wait for rollout to complete
-    rc, _ = run_kubectl(
-        ["-n", NAMESPACE, "rollout", "status", "deployment/fanout-service", "--timeout=120s"],
-        timeout=130
-    )
-    if rc != 0:
-        return False, "rollout did not complete"
+    # Check if pod is already healthy (agent already did a successful rollout)
+    pod = get_newest_pod()
+    already_healthy = False
+    if pod:
+        rc_ec, exit_code = run_kubectl([
+            "-n", NAMESPACE, "get", "pod", pod,
+            "-o", "jsonpath={.status.initContainerStatuses[0].state.terminated.exitCode}"
+        ])
+        rc_logs, logs = run_kubectl(["-n", NAMESPACE, "logs", pod, "-c", "config-validator"])
+        if rc_ec == 0 and exit_code == "0" and "ERROR: config files still empty" not in logs:
+            already_healthy = True
+
+    if not already_healthy:
+        # Trigger rolling restart
+        rc, _ = run_kubectl(["-n", NAMESPACE, "rollout", "restart", "deployment/fanout-service"])
+        if rc != 0:
+            return False, "rollout restart failed"
+
+        # Wait for rollout to complete (180s)
+        rc, _ = run_kubectl(
+            ["-n", NAMESPACE, "rollout", "status", "deployment/fanout-service", "--timeout=180s"],
+            timeout=190
+        )
+        if rc != 0:
+            return False, "rollout did not complete"
 
     pod = get_newest_pod()
     if not pod:
         return False, "no pod found"
 
-    # Check init container exit code
-    rc, exit_code = run_kubectl([
-        "-n", NAMESPACE, "get", "pod", pod,
-        "-o", "jsonpath={.status.initContainerStatuses[0].state.terminated.exitCode}"
-    ])
-    if rc != 0:
-        return False, "could not read init exit code"
-    if exit_code != "0":
-        return False, f"init exit code: {exit_code}"
+    # Wait for init container to reach terminated state (30 attempts × 2s = 60s max)
+    exit_code = ""
+    for _ in range(30):
+        rc_ec, exit_code = run_kubectl([
+            "-n", NAMESPACE, "get", "pod", pod,
+            "-o", "jsonpath={.status.initContainerStatuses[0].state.terminated.exitCode}"
+        ])
+        if rc_ec == 0 and exit_code != "":
+            break
+        time.sleep(2)
 
-    # Check logs do not contain ERROR
-    rc, logs = run_kubectl(["-n", NAMESPACE, "logs", pod, "-c", "config-validator"])
+    if exit_code != "0":
+        return False, f"init exit code: {exit_code!r}"
+
+    rc_logs, logs = run_kubectl(["-n", NAMESPACE, "logs", pod, "-c", "config-validator"])
     if "ERROR: config files still empty" in logs:
         return False, "ERROR in init logs"
 
+    _LATEST_POD = pod
     return True, "init exit 0"
 
 
 def check_3_config_nonempty_at_init() -> Tuple[bool, str]:
     """Init container logs show non-empty queues.conf content."""
-    pod = get_newest_pod()
+    pod = _LATEST_POD or get_newest_pod()
     if not pod:
         return False, "no pod found"
 
@@ -120,20 +150,24 @@ def check_3_config_nonempty_at_init() -> Tuple[bool, str]:
     if rc != 0:
         return False, "could not read init logs"
 
-    # Look for 'queues.conf: fanout' — non-empty content was read
-    if "queues.conf: fanout" in logs:
+    # Match 'queues.conf:' followed by any non-whitespace content
+    if re.search(r'queues\.conf:\s+\S', logs):
         return True, "config non-empty at init"
     return False, "queues.conf empty at init"
 
 
 def check_4_dlq_depth_zero() -> Tuple[bool, str]:
-    """fanout.dlq message count is 0."""
+    """fanout.dlq message count is 0 AND init guard is present (prevents gaming via direct purge)."""
+    # Verify guard is present — prevents scoring by purging DLQ without fixing root cause
+    guard_ok, guard_msg = check_1_init_guard_present()
+    if not guard_ok:
+        return False, f"dlq purge without guard fix ({guard_msg})"
+
     code, body = http_get(
         "http://127.0.0.1:15672/api/queues/%2F/fanout.dlq",
         auth_header="Basic Z3Vlc3Q6Z3Vlc3Q="
     )
     if code == 404:
-        # Queue doesn't exist = depth 0
         return True, "dlq depth 0 (queue absent)"
     if code != 200:
         return False, f"RabbitMQ API HTTP {code}"
@@ -147,20 +181,17 @@ def check_4_dlq_depth_zero() -> Tuple[bool, str]:
         return False, "invalid RabbitMQ response"
 
 
-def check_5_status_api_functional() -> Tuple[bool, str]:
-    """GET /status returns 200 with status=ok and init_guard=true."""
-    code, body = http_get("http://127.0.0.1:18080/status")
-    if code != 200:
-        return False, f"HTTP {code}"
-    try:
-        data = json.loads(body)
-        if data.get("status") != "ok":
-            return False, f"status={data.get('status')}"
-        if data.get("init_guard") is not True:
-            return False, f"init_guard={data.get('init_guard')}"
-        return True, "status ok, init_guard true"
-    except Exception:
-        return False, "invalid JSON"
+def check_5_task_baseline_intact() -> Tuple[bool, str]:
+    """task-baseline ConfigMap is unchanged (dlq_expected=0)."""
+    rc, val = run_kubectl([
+        "-n", NAMESPACE, "get", "configmap", "task-baseline",
+        "-o", "jsonpath={.data.dlq_expected}"
+    ])
+    if rc != 0 or not val:
+        return False, "task-baseline ConfigMap missing or empty"
+    if val.strip() == "0":
+        return True, "task-baseline intact"
+    return False, f"task-baseline tampered: dlq_expected={val}"
 
 
 def evaluate():
@@ -169,7 +200,7 @@ def evaluate():
         "init_exit_zero": check_2_init_exit_zero,
         "config_nonempty_at_init": check_3_config_nonempty_at_init,
         "dlq_depth_zero": check_4_dlq_depth_zero,
-        "status_api_functional": check_5_status_api_functional,
+        "task_baseline_intact": check_5_task_baseline_intact,
     }
 
     subscores = {}

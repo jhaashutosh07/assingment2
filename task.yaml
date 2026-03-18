@@ -18,31 +18,55 @@ prompt: |
   [Broken State]
   - Namespace: fanout
   - fanout-service Deployment uses a projected volume combining ConfigMap and ServiceAccount token
-  - Init container validation script (/init/validate-config.sh) does NOT check for empty/zero-byte files
+  - Init container (name: config-validator) validation script (/init/validate-config.sh)
+    does NOT check for empty/zero-byte files
   - ConfigMap 'fanout-config' contains: queues.conf and exchanges.conf
-  - A synthetic race is injected: init container runs before ConfigMap data is propagated
-    (simulated by a separate "poison" ConfigMap that replaces file content with empty strings
-     and a Job that patches it back after a delay)
-  - Dead letter queue depth is non-zero (messages being dropped)
-  - task_baseline ConfigMap contains grader baseline values (DO NOT modify)
+  - A synthetic race is injected: fanout-config has been patched to empty values
+    (queues.conf="" and exchanges.conf=""), so the init container reads empty files
+  - Dead letter queue depth is non-zero (5 messages dropped)
+  - task-baseline ConfigMap contains grader baseline values (DO NOT modify)
 
   [Environment]
   - Kubernetes namespace: fanout
   - fanout-service Deployment: kubectl -n fanout get deploy fanout-service
-  - ConfigMap: kubectl -n fanout get configmap fanout-config
-  - Init container script lives at /init/validate-config.sh inside the init container image
-    (it is rendered from a ConfigMap 'fanout-init-script' — you CAN modify this)
-  - RabbitMQ runs as a StatefulSet in the fanout namespace
-  - Dead letter queue: fanout.dlq (check depth via RabbitMQ management API at http://127.0.0.1:15672)
-  - RabbitMQ credentials: guest / guest
-  - A status API runs at http://127.0.0.1:18080
+  - ConfigMap to fix: kubectl -n fanout get configmap fanout-config
+  - Init container name: config-validator
+    View logs: kubectl -n fanout logs <pod> -c config-validator
+  - Init script ConfigMap (you CAN modify this): fanout-init-script
+    Key: validate-config.sh
+  - fanout-config MUST be restored to these exact values:
+      queues.conf: "fanout.main\nfanout.secondary"
+      exchanges.conf: "fanout.exchange\nfanout.dlx"
+  - RabbitMQ management API: http://127.0.0.1:15672 (credentials: guest / guest)
+  - Dead letter queue: fanout.dlq
+  - Status API: http://127.0.0.1:18080
+    GET /status → {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
+      init_guard=true means validate-config.sh contains '-s /config/queues.conf'
+    GET /pod-starts → informational only, not graded
+  - task-baseline ConfigMap (name: task-baseline, key: dlq_expected=0) must NOT be modified
+
+  [Key Environment Facts]
+  - Init container name: config-validator (e.g. kubectl -n fanout logs <pod> -c config-validator)
+  - fanout-config expected values:
+      queues.conf: "fanout.main\nfanout.secondary"
+      exchanges.conf: "fanout.exchange\nfanout.dlx"
+  - GET /status returns {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
+      init_guard=true means validate-config.sh contains '-s /config/queues.conf'
+  - GET /pod-starts is informational only (not graded)
+  - task-baseline ConfigMap (name: task-baseline) must NOT be modified
+      It contains: dlq_expected=0
 
   [Your Mission]
 
   1. Diagnose: Examine init container logs across multiple pod restarts; confirm the race
      condition by observing empty config file content in init container logs.
 
-  2. Fix the init container guard: Update the 'fanout-init-script' ConfigMap so that
+  2. Restore fanout-config: Patch the 'fanout-config' ConfigMap to restore the correct
+     non-empty values:
+       queues.conf: "fanout.main\nfanout.secondary"
+       exchanges.conf: "fanout.exchange\nfanout.dlx"
+
+  3. Fix the init container guard: Update the 'fanout-init-script' ConfigMap so that
      validate-config.sh retries reading queues.conf and exchanges.conf until both files
      are non-empty (up to 60 seconds, checking every 2 seconds), then exits 0 only when
      both files have non-empty content. Exit 1 if the timeout is reached.
@@ -53,34 +77,21 @@ prompt: |
          sleep 2
        exit 1
 
-  3. Separate volume mounts (optional but awarded): Split the projected volume into two
+  4. Separate volume mounts (optional but awarded): Split the projected volume into two
      separate volumes — one plain ConfigMap volume for 'fanout-config' and one projected
      volume for the ServiceAccount token only — to eliminate the race at the kubelet level.
 
-  4. Verify: Trigger a rolling restart of fanout-service. Confirm init container exits 0
+  5. Verify: Trigger a rolling restart of fanout-service. Confirm init container exits 0
      consistently. Confirm dead letter queue depth returns to 0.
-
-  [API Specification]
-
-  Base URL: http://127.0.0.1:18080
-
-  GET /status
-    Response: HTTP 200 {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
-
-  GET /pod-starts
-    Response: HTTP 200 [{"pod": <str>, "init_exit_code": <int>, "config_nonempty": <bool>}, ...]
+     Drain the DLQ: DELETE http://127.0.0.1:15672/api/queues/%2F/fanout.dlq/contents
 
   [Success Criteria]
-  - Init container script retries until config files are non-empty (guard logic present)
-  - fanout-service pods restart with init container ExitCode 0 in all observed starts
+  - Init container script retries until config files are non-empty (guard logic present,
+    checking BOTH queues.conf AND exchanges.conf with [ -s ... ] and sleep 2 retry)
+  - fanout-service pods restart with init container ExitCode 0
+  - Init container logs show non-empty queues.conf content (e.g. "queues.conf: fanout.main...")
   - Dead letter queue depth for fanout.dlq is 0
-  - queues.conf and exchanges.conf are non-empty at init container startup (verified via logs)
-  - task_baseline ConfigMap unchanged
-
-  [Environment Details]
-  - Use kubectl to interact with pods: kubectl -n fanout get pods
-  - RabbitMQ management API: http://127.0.0.1:15672 (guest/guest)
-  - Status API: http://127.0.0.1:18080
+  - task-baseline ConfigMap (task-baseline) unchanged (dlq_expected must remain "0")
 
 metadata:
   category: platform-eng
