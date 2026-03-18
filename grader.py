@@ -4,6 +4,15 @@ Grader - PRIVATE (not accessible to agent)
 Tests actual working features with proper error handling
 """
 
+import os
+# Remove this file from disk to prevent agent access
+try:
+    _self = os.path.abspath(__file__)
+    if os.path.exists(_self) and os.path.basename(_self) == 'grader.py':
+        os.unlink(_self)
+except Exception:
+    pass
+
 import json, subprocess, sys, uuid, time, threading
 from typing import Tuple
 
@@ -90,10 +99,14 @@ def check_2_orphans_fixed() -> Tuple[bool, str]:
     if not ok or count != "0":
         return False, f"orphans: {count}"
     
-    ok, baseline = psql("SELECT value FROM statping_task.task_baseline WHERE key = 'uptime_count'")
-    ok, current = psql("SELECT COUNT(*) FROM statping_task.uptime_history")
-    if not ok or baseline != current:
-        return False, f"uptime changed"
+    ok_baseline, baseline = psql("SELECT value FROM statping_task.task_baseline WHERE key = 'uptime_count'")
+    if not ok_baseline or not baseline:
+        return False, "task_baseline missing"
+    ok_current, current = psql("SELECT COUNT(*) FROM statping_task.uptime_history")
+    if not ok_current:
+        return False, "uptime_history query failed"
+    if baseline != current:
+        return False, f"uptime changed: expected {baseline}, got {current}"
     
     return True, "orphans fixed"
 

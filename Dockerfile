@@ -4,7 +4,11 @@ ENV DISPLAY_NUM=1
 ENV COMPUTER_HEIGHT_PX=768
 ENV COMPUTER_WIDTH_PX=1024
 
-RUN apt-get update && apt-get install -y curl postgresql-client python3 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    postgresql-client \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY setup.sh solution.sh /
 RUN chmod +x /setup.sh /solution.sh
