@@ -20,6 +20,8 @@ prompt: |
   - service_groups table: Only IDs 2 ('valid-group') and 5 ('unreferenced-group') exist
   - No FK constraint preventing orphaned references
   - Old protective triggers that don't work properly
+  - task_baseline table: Contains grader baseline values (DO NOT modify)
+  - uptime_history table: Must be preserved exactly as-is (row count is baselined)
   
   [API Specification]
   
@@ -44,7 +46,8 @@ prompt: |
      - Must be atomic transaction
   3. Protect: Create FK constraint and trigger to prevent future violations
      - FK: incidents_service_group_id_fkey (ON DELETE RESTRICT, VALIDATED)
-     - Trigger: prevent_service_group_delete function
+     - Trigger object name: prevent_service_group_delete (BEFORE DELETE ON service_groups)
+     - Trigger function name: prevent_service_group_delete
      - Trigger: Must block DELETE on service_groups with active incidents
   4. Cleanup: Remove old broken triggers (legacy_delete_trigger, legacy_block_delete)
   5. Verify: Test that incident creation works (HTTP 201) and concurrency is safe

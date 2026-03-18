@@ -5,15 +5,28 @@ trap 'echo "[!] Setup failed at line ${LINENO}" >&2; exit 1' ERR
 NAMESPACE="bleater"
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
-echo "[*] Waiting for PostgreSQL..."
+echo "[*] Waiting for PostgreSQL pod..."
+PG_POD=""
 for i in {1..60}; do
-  PG_POD=$(kubectl -n "$NAMESPACE" get pods -o name 2>/dev/null | grep postgres | head -1 | cut -d/ -f2) && break
+  PG_POD=$(kubectl -n "$NAMESPACE" get pods -o name 2>/dev/null | grep postgres | head -1 | cut -d/ -f2)
+  [ -n "$PG_POD" ] && break
   sleep 1
 done
 
-[ -n "$PG_POD" ] || (echo "[!] PostgreSQL not found" >&2; exit 1)
+[ -n "$PG_POD" ] || { echo "[!] PostgreSQL pod not found" >&2; exit 1; }
 
 PSQL_BASE="PGPASSWORD=bleater psql -U bleater -d bleater -q"
+
+echo "[*] Waiting for PostgreSQL to accept connections..."
+for i in {1..60}; do
+  kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "PGPASSWORD=bleater pg_isready -U bleater -d bleater -q" 2>/dev/null && break
+  sleep 2
+done
+
+kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "PGPASSWORD=bleater pg_isready -U bleater -d bleater -q" || {
+  echo "[!] PostgreSQL not accepting connections" >&2; exit 1
+}
+
 cat > /tmp/statping_task.env <<EOF
 NAMESPACE=$NAMESPACE
 PG_POD=$PG_POD
@@ -84,6 +97,8 @@ BEFORE DELETE ON statping_task.service_groups
 FOR EACH ROW EXECUTE FUNCTION statping_task.legacy_block_delete();
 
 SCHEMA_SQL
+rc=$?
+[ $rc -eq 0 ] || { echo "[!] Schema creation failed (exit $rc)" >&2; exit 1; }
 
 # Insert orphaned and NULL incidents (variables substituted here)
 cat > /tmp/orphans.sql <<ORPHAN_INSERT
@@ -101,9 +116,21 @@ SELECT NULL, 'null-incident-' || i FROM generate_series(1, $NULL_COUNT) AS i;
 ORPHAN_INSERT
 
 kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE" < /tmp/orphans.sql
+rc=$?
+[ $rc -eq 0 ] || { echo "[!] Orphan insert failed (exit $rc)" >&2; exit 1; }
 rm -f /tmp/orphans.sql
 
 echo "[✓] Created broken state: $ORPHAN_TOTAL orphans, $NULL_COUNT NULLs"
+
+echo "[*] Verifying setup..."
+SCHEMA_CHECK=$(kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE -t -A -c \"SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'statping_task'\"")
+[ "$SCHEMA_CHECK" = "1" ] || { echo "[!] Schema verification failed" >&2; exit 1; }
+
+TABLE_CHECK=$(kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE -t -A -c \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'statping_task' AND table_name IN ('incidents','service_groups','uptime_history','task_baseline')\"")
+[ "$TABLE_CHECK" = "4" ] || { echo "[!] Table verification failed: expected 4, got $TABLE_CHECK" >&2; exit 1; }
+
+ORPHAN_CHECK=$(kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE -t -A -c \"SELECT COUNT(*) FROM statping_task.incidents WHERE service_group_id IS NULL OR service_group_id NOT IN (SELECT id FROM statping_task.service_groups)\"")
+echo "[✓] Setup verified: schema exists, $TABLE_CHECK/4 tables present, $ORPHAN_CHECK orphans created"
 
 # Start API server
 cat > /tmp/api.py <<'PYTHON_API'
