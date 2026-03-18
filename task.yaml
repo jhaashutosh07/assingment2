@@ -49,7 +49,10 @@ prompt: |
      - Trigger object name: prevent_service_group_delete (BEFORE DELETE ON service_groups)
      - Trigger function name: prevent_service_group_delete
      - Trigger: Must block DELETE on service_groups with active incidents
-  4. Cleanup: Remove old broken triggers (legacy_delete_trigger, legacy_block_delete)
+  4. Cleanup: Remove old broken triggers and their functions:
+     - DROP TRIGGER legacy_delete_trigger ON statping_task.service_groups
+     - DROP FUNCTION statping_task.legacy_block_delete() (trigger function, use CASCADE)
+     - Verify: no functions or triggers with 'legacy_' prefix should remain
   5. Verify: Test that incident creation works (HTTP 201) and concurrency is safe
   
   [Success Criteria]
@@ -60,6 +63,12 @@ prompt: |
   - Old triggers removed
   - 10+ concurrent requests succeed within 5 seconds
   - uptime_history row count unchanged
+
+  [Environment]
+  - The PostgreSQL database runs inside a Kubernetes pod in the 'bleater' namespace
+  - Use kubectl to interact with pods: kubectl -n bleater get pods
+  - Connection details are available at /tmp/statping_task.env (NAMESPACE, PG_POD, PSQL_BASE)
+  - The API server runs locally at http://127.0.0.1:18080
 
 metadata:
   category: devops

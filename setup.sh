@@ -122,15 +122,23 @@ rm -f /tmp/orphans.sql
 
 echo "[✓] Created broken state: $ORPHAN_TOTAL orphans, $NULL_COUNT NULLs"
 
+pg_query() {
+  kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "PGPASSWORD=bleater psql -U bleater -d bleater -q -t -A -c \"$1\"" 2>/dev/null
+}
+
 echo "[*] Verifying setup..."
-SCHEMA_CHECK=$(kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE -t -A -c \"SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'statping_task'\"")
+SCHEMA_CHECK=$(pg_query "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'statping_task'")
 [ "$SCHEMA_CHECK" = "1" ] || { echo "[!] Schema verification failed" >&2; exit 1; }
 
-TABLE_CHECK=$(kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE -t -A -c \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'statping_task' AND table_name IN ('incidents','service_groups','uptime_history','task_baseline')\"")
+TABLE_CHECK=$(pg_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'statping_task' AND table_name IN ('incidents','service_groups','uptime_history','task_baseline')")
 [ "$TABLE_CHECK" = "4" ] || { echo "[!] Table verification failed: expected 4, got $TABLE_CHECK" >&2; exit 1; }
 
-ORPHAN_CHECK=$(kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE -t -A -c \"SELECT COUNT(*) FROM statping_task.incidents WHERE service_group_id IS NULL OR service_group_id NOT IN (SELECT id FROM statping_task.service_groups)\"")
+ORPHAN_CHECK=$(pg_query "SELECT COUNT(*) FROM statping_task.incidents WHERE service_group_id IS NULL OR service_group_id NOT IN (SELECT id FROM statping_task.service_groups)")
 echo "[✓] Setup verified: schema exists, $TABLE_CHECK/4 tables present, $ORPHAN_CHECK orphans created"
+
+TRIGGER_CHECK=$(pg_query "SELECT COUNT(*) FROM pg_trigger WHERE tgname = 'legacy_delete_trigger'")
+[ "$TRIGGER_CHECK" = "1" ] || { echo "[!] Legacy trigger verification failed" >&2; exit 1; }
+echo "[✓] Legacy trigger confirmed present"
 
 # Start API server
 cat > /tmp/api.py <<'PYTHON_API'
@@ -202,8 +210,14 @@ except:
 PYTHON_API
 
 nohup python3 /tmp/api.py >/tmp/api.log 2>&1 &
-sleep 2
 
-echo "[✓] API server started"
+echo "[*] Waiting for API server to be ready..."
+for i in {1..15}; do
+  curl -sf http://127.0.0.1:18080/status >/dev/null 2>&1 && break
+  sleep 1
+done
+curl -sf http://127.0.0.1:18080/status >/dev/null 2>&1 || { echo "[!] API server failed to start" >&2; exit 1; }
+echo "[✓] API server ready"
+
 echo "[✓] Setup complete"
 exit 0
