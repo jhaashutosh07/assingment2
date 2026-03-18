@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Grader - PRIVATE (not accessible to agent)
-Tests actual working features with proper error handling
+fanout-configmap-race: 5 checks, each weighted 0.2
 """
 
 import os
@@ -13,7 +13,7 @@ try:
 except Exception:
     pass
 
-import json, subprocess, sys, uuid, time, threading
+import json, subprocess, sys, time
 from typing import Tuple
 
 try:
@@ -23,205 +23,179 @@ except Exception:
         def __init__(self, score, subscores=None, weights=None, feedback=""):
             super().__init__(score=score, subscores=subscores or {}, weights=weights or {}, feedback=feedback)
 
-_ENV = {}
+NAMESPACE = "fanout"
 
-def run_cmd(cmd: str, timeout: int = 30) -> Tuple[int, str]:
+
+def run_kubectl(args: list, timeout: int = 30) -> Tuple[int, str]:
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(
+            ["kubectl"] + args,
+            capture_output=True, text=True, timeout=timeout
+        )
         return p.returncode, p.stdout.strip()
-    except:
+    except Exception:
         return 1, ""
 
-def load_env() -> bool:
-    global _ENV
-    if _ENV:
-        return True
-    rc, out = run_cmd("cat /tmp/statping_task.env 2>/dev/null")
-    if rc != 0:
-        return False
-    for line in out.splitlines():
-        if "=" in line:
-            k, v = line.split("=", 1)
-            _ENV[k] = v
-    return len(_ENV) >= 3
 
-def psql(sql: str) -> Tuple[bool, str]:
-    if not load_env():
-        return False, ""
-    ns, pod, base = _ENV.get("NAMESPACE", ""), _ENV.get("PG_POD", ""), _ENV.get("PSQL_BASE", "")
-    if not (ns and pod and base):
-        return False, ""
-    cmd = f"kubectl exec -n {ns} {pod} -- sh -c '{base} -t -A -c \"{sql}\"' 2>/dev/null"
-    rc, out = run_cmd(cmd, 30)
-    return rc == 0, out
-
-def http(method: str, path: str, payload=None) -> Tuple[int, str]:
+def http_get(url: str, auth_header: str = None, timeout: int = 10) -> Tuple[int, str]:
     import urllib.request, urllib.error
     try:
-        data = json.dumps(payload).encode() if payload else None
-        req = urllib.request.Request(f"http://127.0.0.1:18080{path}", data=data, method=method, 
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as r:
+        req = urllib.request.Request(url)
+        if auth_header:
+            req.add_header("Authorization", auth_header)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.getcode(), r.read().decode()
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode()
-    except:
+    except Exception:
         return 0, ""
 
-def check_1_incident_api_functional() -> Tuple[bool, str]:
-    """Can we create incidents via API?"""
-    ok, gid = psql("SELECT id FROM statping_task.service_groups LIMIT 1")
-    if not ok or not gid:
-        return False, "no service_group"
-    
-    test_id = uuid.uuid4().hex[:16]
-    code, response = http("POST", "/incidents", {"service_group_id": int(gid), "summary": f"test-{test_id}"})
-    
-    if code != 201:
-        return False, f"HTTP {code}"
-    
+
+def get_newest_pod() -> str:
+    rc, out = run_kubectl([
+        "-n", NAMESPACE, "get", "pods", "-l", "app=fanout-service",
+        "--sort-by=.metadata.creationTimestamp",
+        "-o", "jsonpath={.items[-1].metadata.name}"
+    ])
+    return out.strip() if rc == 0 else ""
+
+
+def check_1_init_guard_present() -> Tuple[bool, str]:
+    """Does validate-config.sh contain the -s guard?"""
+    rc, script = run_kubectl([
+        "-n", NAMESPACE, "get", "configmap", "fanout-init-script",
+        "-o", "jsonpath={.data.validate-config\\.sh}"
+    ])
+    if rc != 0 or not script:
+        return False, "fanout-init-script ConfigMap not found"
+    if "-s /config/queues.conf" in script:
+        return True, "guard present"
+    return False, "guard missing"
+
+
+def check_2_init_exit_zero() -> Tuple[bool, str]:
+    """After rolling restart, init container exits 0 and no ERROR in logs."""
+    # Trigger rolling restart
+    rc, _ = run_kubectl(["-n", NAMESPACE, "rollout", "restart", "deployment/fanout-service"])
+    if rc != 0:
+        return False, "rollout restart failed"
+
+    # Wait for rollout to complete
+    rc, _ = run_kubectl(
+        ["-n", NAMESPACE, "rollout", "status", "deployment/fanout-service", "--timeout=120s"],
+        timeout=130
+    )
+    if rc != 0:
+        return False, "rollout did not complete"
+
+    pod = get_newest_pod()
+    if not pod:
+        return False, "no pod found"
+
+    # Check init container exit code
+    rc, exit_code = run_kubectl([
+        "-n", NAMESPACE, "get", "pod", pod,
+        "-o", "jsonpath={.status.initContainerStatuses[0].state.terminated.exitCode}"
+    ])
+    if rc != 0:
+        return False, "could not read init exit code"
+    if exit_code != "0":
+        return False, f"init exit code: {exit_code}"
+
+    # Check logs do not contain ERROR
+    rc, logs = run_kubectl(["-n", NAMESPACE, "logs", pod, "-c", "config-validator"])
+    if "ERROR: config files still empty" in logs:
+        return False, "ERROR in init logs"
+
+    return True, "init exit 0"
+
+
+def check_3_config_nonempty_at_init() -> Tuple[bool, str]:
+    """Init container logs show non-empty queues.conf content."""
+    pod = get_newest_pod()
+    if not pod:
+        return False, "no pod found"
+
+    rc, logs = run_kubectl(["-n", NAMESPACE, "logs", pod, "-c", "config-validator"])
+    if rc != 0:
+        return False, "could not read init logs"
+
+    # Look for 'queues.conf: fanout' — non-empty content was read
+    if "queues.conf: fanout" in logs:
+        return True, "config non-empty at init"
+    return False, "queues.conf empty at init"
+
+
+def check_4_dlq_depth_zero() -> Tuple[bool, str]:
+    """fanout.dlq message count is 0."""
+    code, body = http_get(
+        "http://127.0.0.1:15672/api/queues/%2F/fanout.dlq",
+        auth_header="Basic Z3Vlc3Q6Z3Vlc3Q="
+    )
+    if code == 404:
+        # Queue doesn't exist = depth 0
+        return True, "dlq depth 0 (queue absent)"
+    if code != 200:
+        return False, f"RabbitMQ API HTTP {code}"
     try:
-        data = json.loads(response)
-        if not isinstance(data.get("id"), int):
-            return False, "invalid response"
-    except:
+        data = json.loads(body)
+        depth = int(data.get("messages", -1))
+        if depth == 0:
+            return True, "dlq depth 0"
+        return False, f"dlq depth {depth}"
+    except Exception:
+        return False, "invalid RabbitMQ response"
+
+
+def check_5_status_api_functional() -> Tuple[bool, str]:
+    """GET /status returns 200 with status=ok and init_guard=true."""
+    code, body = http_get("http://127.0.0.1:18080/status")
+    if code != 200:
+        return False, f"HTTP {code}"
+    try:
+        data = json.loads(body)
+        if data.get("status") != "ok":
+            return False, f"status={data.get('status')}"
+        if data.get("init_guard") is not True:
+            return False, f"init_guard={data.get('init_guard')}"
+        return True, "status ok, init_guard true"
+    except Exception:
         return False, "invalid JSON"
-    
-    ok, count = psql(f"SELECT COUNT(*) FROM statping_task.incidents WHERE summary = 'test-{test_id}'")
-    if not ok or count != "1":
-        return False, "not in DB"
-    
-    return True, "API functional"
 
-def check_2_orphans_fixed() -> Tuple[bool, str]:
-    """Are all orphans fixed?"""
-    ok, count = psql("SELECT COUNT(*) FROM statping_task.incidents WHERE service_group_id IS NULL OR service_group_id NOT IN (SELECT id FROM statping_task.service_groups)")
-    if not ok or count != "0":
-        return False, f"orphans: {count}"
-    
-    ok_baseline, baseline = psql("SELECT value FROM statping_task.task_baseline WHERE key = 'uptime_count'")
-    if not ok_baseline or not baseline:
-        return False, "task_baseline missing"
-    ok_current, current = psql("SELECT COUNT(*) FROM statping_task.uptime_history")
-    if not ok_current:
-        return False, "uptime_history query failed"
-    if baseline != current:
-        return False, f"uptime changed: expected {baseline}, got {current}"
-    
-    return True, "orphans fixed"
-
-def check_3_fk_constraint() -> Tuple[bool, str]:
-    """Does FK exist and is VALIDATED?"""
-    ok, res = psql("SELECT convalidated, confdeltype FROM pg_constraint WHERE conname = 'incidents_service_group_id_fkey' AND conrelid::regclass::text = 'statping_task.incidents'")
-    
-    if not ok or not res:
-        return False, "FK missing"
-    
-    parts = res.split("|")
-    if len(parts) < 2 or parts[0] != "t" or parts[1] != "r":
-        return False, "FK invalid"
-    
-    return True, "FK valid"
-
-def check_4_trigger_blocks_delete() -> Tuple[bool, str]:
-    """Does trigger function exist and block DELETE?"""
-    ok, res = psql("SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'statping_task' AND p.proname = 'prevent_service_group_delete'")
-    if not ok or res != "1":
-        return False, "function missing"
-    
-    ok, res = psql("SELECT COUNT(*) FROM pg_trigger WHERE tgname = 'prevent_service_group_delete' AND tgrelid::regclass::text = 'statping_task.service_groups'")
-    if not ok or res != "1":
-        return False, "trigger not attached"
-    
-    ok, res = psql("SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'statping_task' AND p.proname LIKE 'legacy_%'")
-    if not ok or res != "0":
-        return False, f"old functions: {res}"
-    
-    ok, res = psql("SELECT COUNT(*) FROM pg_trigger WHERE tgname LIKE 'legacy_%'")
-    if not ok or res != "0":
-        return False, f"old trigger objects remain: {res}"
-    
-    # Functional test: attempt DELETE on a service_group that has incidents
-    ok, gid = psql("SELECT service_group_id FROM statping_task.incidents WHERE service_group_id IS NOT NULL LIMIT 1")
-    if ok and gid:
-        try:
-            gid_int = int(gid)
-        except (ValueError, TypeError):
-            return False, "invalid service_group_id"
-        ok_del, del_out = psql(f"DELETE FROM statping_task.service_groups WHERE id = {gid_int}")
-        # DELETE should fail (rc != 0 means exception was raised = trigger worked)
-        if ok_del:
-            return False, "trigger did not block DELETE"
-        # Confirm row still exists
-        ok_chk, cnt = psql(f"SELECT COUNT(*) FROM statping_task.service_groups WHERE id = {gid_int}")
-        if not ok_chk or cnt != "1":
-            return False, "service_group was deleted (trigger failed)"
-    
-    return True, "trigger enforces"
-
-def check_5_concurrency() -> Tuple[bool, str]:
-    """Do 10 concurrent requests succeed?"""
-    ok, gid = psql("SELECT id FROM statping_task.service_groups LIMIT 1")
-    if not ok or not gid:
-        return False, "no service_group"
-    
-    results = []
-    lock = threading.Lock()
-    
-    def req(i):
-        code, _ = http("POST", "/incidents", {"service_group_id": int(gid), "summary": f"concurrent-{uuid.uuid4().hex[:8]}"})
-        if code == 201:
-            with lock:
-                results.append(i)
-    
-    start = time.time()
-    threads = [threading.Thread(target=req, args=(i,)) for i in range(10)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    
-    elapsed = time.time() - start
-    
-    if len(results) < 10:
-        return False, f"{len(results)}/10"
-    if elapsed > 5:
-        return False, f"{elapsed:.1f}s"
-    
-    return True, "10/10 concurrent"
 
 def evaluate():
     checks = {
-        "incident_api": check_1_incident_api_functional,
-        "orphans_fixed": check_2_orphans_fixed,
-        "fk_constraint": check_3_fk_constraint,
-        "trigger_blocks": check_4_trigger_blocks_delete,
-        "concurrency": check_5_concurrency,
+        "init_guard_present": check_1_init_guard_present,
+        "init_exit_zero": check_2_init_exit_zero,
+        "config_nonempty_at_init": check_3_config_nonempty_at_init,
+        "dlq_depth_zero": check_4_dlq_depth_zero,
+        "status_api_functional": check_5_status_api_functional,
     }
-    
+
     subscores = {}
     feedback = []
-    
+
     for name, fn in checks.items():
         try:
             ok, msg = fn()
             subscores[name] = 1.0 if ok else 0.0
             feedback.append(f"[{name}] {msg}")
-        except:
+        except Exception:
             subscores[name] = 0.0
             feedback.append(f"[{name}] error")
-    
+
     weights = {k: 0.2 for k in checks}
     score = sum(subscores.get(k, 0) * weights[k] for k in checks)
-    
     return subscores, weights, " | ".join(feedback), score
+
 
 def grade(_: str) -> GradingResult:
     try:
         subs, w, fb, sc = evaluate()
         return GradingResult(score=sc, subscores=subs, weights=w, feedback=fb)
-    except:
+    except Exception:
         return GradingResult(score=0.0, subscores={}, weights={}, feedback="error")
+
 
 def main():
     try:
@@ -229,8 +203,9 @@ def main():
         print(fb)
         print(json.dumps({"score": sc, "subscores": subs}, indent=2))
         sys.exit(0 if sc >= 0.99 else 1)
-    except:
+    except Exception:
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

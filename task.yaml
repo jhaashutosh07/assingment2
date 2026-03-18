@@ -1,76 +1,98 @@
-id: statping-fk-incident
+id: fanout-configmap-race
 
 prompt: |
-  [PRODUCTION INCIDENT: Statping-ng Incident Creation Non-Functional]
-  
-  Issue: #678
+  [PRODUCTION INCIDENT: fanout-service ConfigMap Init Container Race Condition]
+
+  Issue: #627
   Severity: CRITICAL
-  
-  During a RabbitMQ brownout, on-call engineers cannot create manual incidents to update 
-  the public status page. The incident creation API returns HTTP 500 with database errors.
-  
-  [Root Cause]
-  A maintenance script deleted service_group records directly via SQL (IDs 1, 3, 4), leaving 
-  orphaned incident records. The missing FK constraint allows this broken state. New incidents 
-  cannot be inserted.
-  
+
+  During a recent platform migration, fanout-service was updated to use a projected volume
+  combining a ConfigMap (queue topology config) with a ServiceAccount token. Under this
+  projected volume, the init container intermittently starts before kubelet has fully
+  propagated the ConfigMap data. The config files exist in the mount point but are empty
+  or zero-byte. The init container validation script does not guard against empty files
+  and proceeds, so the main container starts with a partially initialized RabbitMQ queue
+  topology. Consumers bind to wrong exchanges and messages are silently routed to the
+  dead letter queue.
+
   [Broken State]
-  - Database schema: statping_task
-  - incidents table: 100-200 orphaned references to deleted service_groups + 10-30 NULL values
-  - service_groups table: Only IDs 2 ('valid-group') and 5 ('unreferenced-group') exist
-  - No FK constraint preventing orphaned references
-  - Old protective triggers that don't work properly
-  - task_baseline table: Contains grader baseline values (DO NOT modify)
-  - uptime_history table: Must be preserved exactly as-is (row count is baselined)
-  
-  [API Specification]
-  
-  Base URL: http://127.0.0.1:18080
-  
-  POST /incidents
-    Request:  {"service_group_id": <int>, "summary": <string>}
-    Success:  HTTP 201 {"id": <int>, "service_group_id": <int>, "summary": <string>}
-    Error:    HTTP 500 (constraint violation - BEFORE repair)
-  
-  GET /incidents
-    Response: HTTP 200 [{"id": <int>, "service_group_id": <int>, "summary": <string>}, ...]
-  
-  GET /status
-    Response: HTTP 200 {"status": "ok"}
-  
-  [Your Mission]
-  
-  1. Diagnose: Identify orphaned incidents and why incident creation fails
-  2. Repair: Update all orphaned/NULL incidents to valid service_group IDs (2 or 5)
-     - Use UPDATE only (no DELETE)
-     - Must be atomic transaction
-  3. Protect: Create FK constraint and trigger to prevent future violations
-     - FK: incidents_service_group_id_fkey (ON DELETE RESTRICT, VALIDATED)
-     - Trigger object name: prevent_service_group_delete (BEFORE DELETE ON service_groups)
-     - Trigger function name: prevent_service_group_delete
-     - Trigger: Must block DELETE on service_groups with active incidents
-  4. Cleanup: Remove old broken triggers and their functions:
-     - DROP TRIGGER legacy_delete_trigger ON statping_task.service_groups
-     - DROP FUNCTION statping_task.legacy_block_delete() (trigger function, use CASCADE)
-     - Verify: no functions or triggers with 'legacy_' prefix should remain
-  5. Verify: Test that incident creation works (HTTP 201) and concurrency is safe
-  
-  [Success Criteria]
-  - Incident creation API returns HTTP 201
-  - All orphaned incidents fixed (0 orphans, 0 NULLs)
-  - FK constraint exists and is VALIDATED
-  - Trigger prevents DELETE on service_groups with incidents
-  - Old triggers removed
-  - 10+ concurrent requests succeed within 5 seconds
-  - uptime_history row count unchanged
+  - Namespace: fanout
+  - fanout-service Deployment uses a projected volume combining ConfigMap and ServiceAccount token
+  - Init container validation script (/init/validate-config.sh) does NOT check for empty/zero-byte files
+  - ConfigMap 'fanout-config' contains: queues.conf and exchanges.conf
+  - A synthetic race is injected: init container runs before ConfigMap data is propagated
+    (simulated by a separate "poison" ConfigMap that replaces file content with empty strings
+     and a Job that patches it back after a delay)
+  - Dead letter queue depth is non-zero (messages being dropped)
+  - task_baseline ConfigMap contains grader baseline values (DO NOT modify)
 
   [Environment]
-  - The PostgreSQL database runs inside a Kubernetes pod in the 'bleater' namespace
-  - Use kubectl to interact with pods: kubectl -n bleater get pods
-  - Connection details are available at /tmp/statping_task.env (NAMESPACE, PG_POD, PSQL_BASE)
-  - The API server runs locally at http://127.0.0.1:18080
+  - Kubernetes namespace: fanout
+  - fanout-service Deployment: kubectl -n fanout get deploy fanout-service
+  - ConfigMap: kubectl -n fanout get configmap fanout-config
+  - Init container script lives at /init/validate-config.sh inside the init container image
+    (it is rendered from a ConfigMap 'fanout-init-script' — you CAN modify this)
+  - RabbitMQ runs as a StatefulSet in the fanout namespace
+  - Dead letter queue: fanout.dlq (check depth via RabbitMQ management API at http://127.0.0.1:15672)
+  - RabbitMQ credentials: guest / guest
+  - A status API runs at http://127.0.0.1:18080
+
+  [Your Mission]
+
+  1. Diagnose: Examine init container logs across multiple pod restarts; confirm the race
+     condition by observing empty config file content in init container logs.
+
+  2. Fix the init container guard: Update the 'fanout-init-script' ConfigMap so that
+     validate-config.sh retries reading queues.conf and exchanges.conf until both files
+     are non-empty (up to 60 seconds, checking every 2 seconds), then exits 0 only when
+     both files have non-empty content. Exit 1 if the timeout is reached.
+
+     Required guard logic (pseudo-code):
+       for i in 1..30:
+         if [ -s /config/queues.conf ] && [ -s /config/exchanges.conf ]: exit 0
+         sleep 2
+       exit 1
+
+  3. Separate volume mounts (optional but awarded): Split the projected volume into two
+     separate volumes — one plain ConfigMap volume for 'fanout-config' and one projected
+     volume for the ServiceAccount token only — to eliminate the race at the kubelet level.
+
+  4. Verify: Trigger a rolling restart of fanout-service. Confirm init container exits 0
+     consistently. Confirm dead letter queue depth returns to 0.
+
+  [API Specification]
+
+  Base URL: http://127.0.0.1:18080
+
+  GET /status
+    Response: HTTP 200 {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
+
+  GET /pod-starts
+    Response: HTTP 200 [{"pod": <str>, "init_exit_code": <int>, "config_nonempty": <bool>}, ...]
+
+  [Success Criteria]
+  - Init container script retries until config files are non-empty (guard logic present)
+  - fanout-service pods restart with init container ExitCode 0 in all observed starts
+  - Dead letter queue depth for fanout.dlq is 0
+  - queues.conf and exchanges.conf are non-empty at init container startup (verified via logs)
+  - task_baseline ConfigMap unchanged
+
+  [Environment Details]
+  - Use kubectl to interact with pods: kubectl -n fanout get pods
+  - RabbitMQ management API: http://127.0.0.1:15672 (guest/guest)
+  - Status API: http://127.0.0.1:18080
 
 metadata:
-  category: devops
-  difficulty: hard
-  horizon: "2-3 hours"
+  category: platform-eng
+  difficulty: medium
+  domains:
+    - configmap-propagation
+    - rabbitmq
+    - kubernetes-workloads
+  components:
+    - fanout-service
+    - RabbitMQ
+    - ConfigMap
+    - projected volume
+    - init container
+  horizon: "5-7 hours"

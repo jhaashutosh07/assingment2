@@ -2,72 +2,60 @@
 set -euo pipefail
 trap 'echo "[!] Error at line ${LINENO}" >&2; exit 1' ERR
 
-if [ ! -f /tmp/statping_task.env ]; then
-  echo "[!] Environment file missing" >&2
-  exit 1
-fi
+NAMESPACE="fanout"
 
-while IFS='=' read -r key value; do
-  export "$key"="$value"
-done < /tmp/statping_task.env
+echo "[+] Step 1: Restore fanout-config to non-empty values..."
+kubectl -n "$NAMESPACE" patch configmap fanout-config \
+  --type merge \
+  -p '{"data":{"queues.conf":"fanout.main\nfanout.secondary","exchanges.conf":"fanout.exchange\nfanout.dlx"}}'
 
-[ -n "${NAMESPACE:-}" ] && [ -n "${PG_POD:-}" ] && [ -n "${PSQL_BASE:-}" ] || exit 1
+echo "[+] Step 2: Update fanout-init-script with guard logic..."
+kubectl -n "$NAMESPACE" create configmap fanout-init-script \
+  --from-literal=validate-config.sh='#!/bin/sh
+# Guard: wait for non-empty config files (up to 60s)
+echo "[init] Waiting for non-empty config files..."
+for i in $(seq 1 30); do
+  if [ -s /config/queues.conf ] && [ -s /config/exchanges.conf ]; then
+    echo "[init] queues.conf: $(cat /config/queues.conf)"
+    echo "[init] exchanges.conf: $(cat /config/exchanges.conf)"
+    echo "[init] Validation complete - config files non-empty"
+    exit 0
+  fi
+  echo "[init] Attempt $i: config files empty, retrying in 2s..."
+  sleep 2
+done
+echo "[init] ERROR: config files still empty after 60s"
+exit 1
+' \
+  --dry-run=client -o yaml | kubectl apply -f -
 
-echo "[+] Executing repair transaction..."
+echo "[+] Step 3: Optionally separate the projected volume..."
+# Patch the Deployment to use separate volumes (removes the race at kubelet level)
+kubectl -n "$NAMESPACE" patch deployment fanout-service --type=json -p='[
+  {"op":"replace","path":"/spec/template/spec/volumes/0","value":{
+    "name":"fanout-config-vol",
+    "configMap":{"name":"fanout-config"}
+  }},
+  {"op":"replace","path":"/spec/template/spec/initContainers/0/volumeMounts/0","value":{
+    "name":"fanout-config-vol",
+    "mountPath":"/config"
+  }}
+]' 2>/dev/null || echo "[*] Volume separation patch skipped (optional)"
 
-# Single atomic transaction - all or nothing
-kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE -v ON_ERROR_STOP=1" <<'TXNSQL'
-BEGIN;
+echo "[+] Step 4: Rolling restart to apply changes..."
+kubectl -n "$NAMESPACE" rollout restart deployment/fanout-service
+kubectl -n "$NAMESPACE" rollout status deployment/fanout-service --timeout=120s
 
--- Fix all orphaned and NULL incidents
-UPDATE statping_task.incidents SET service_group_id = 2
-WHERE service_group_id IS NULL OR service_group_id NOT IN (SELECT id FROM statping_task.service_groups);
+echo "[+] Step 5: Drain the dead letter queue..."
+# Purge fanout.dlq via RabbitMQ management API
+curl -s -u guest:guest -X DELETE \
+  "http://127.0.0.1:15672/api/queues/%2F/fanout.dlq/contents" \
+  -H "content-type: application/json" || true
 
--- Verify orphan fix
-DO $$
-DECLARE cnt INT;
-BEGIN
-  SELECT COUNT(*) INTO cnt FROM statping_task.incidents 
-  WHERE service_group_id IS NULL OR service_group_id NOT IN (SELECT id FROM statping_task.service_groups);
-  IF cnt > 0 THEN RAISE EXCEPTION 'Orphans remain'; END IF;
-END $$;
+echo "[+] Step 6: Capture init container log..."
+NEW_POD=$(kubectl -n "$NAMESPACE" get pods -l app=fanout-service \
+  --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
+kubectl -n "$NAMESPACE" logs "$NEW_POD" -c config-validator > /tmp/fanout_init_log.txt 2>/dev/null || true
 
--- Create FK constraint
-ALTER TABLE statping_task.incidents DROP CONSTRAINT IF EXISTS incidents_service_group_id_fkey;
-ALTER TABLE statping_task.incidents ADD CONSTRAINT incidents_service_group_id_fkey 
-FOREIGN KEY (service_group_id) REFERENCES statping_task.service_groups(id) ON DELETE RESTRICT;
-ALTER TABLE statping_task.incidents VALIDATE CONSTRAINT incidents_service_group_id_fkey;
-
--- Remove old broken triggers
-DROP TRIGGER IF EXISTS legacy_delete_trigger ON statping_task.service_groups;
-DROP FUNCTION IF EXISTS statping_task.legacy_block_delete() CASCADE;
-
--- Create protective trigger function
-CREATE FUNCTION statping_task.prevent_service_group_delete() RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-  IF EXISTS (SELECT 1 FROM statping_task.incidents WHERE service_group_id = OLD.id) THEN
-    RAISE EXCEPTION 'Cannot delete service_group % with active incidents', OLD.id;
-  END IF;
-  RETURN OLD;
-END $$;
-
--- Attach trigger
-CREATE TRIGGER prevent_service_group_delete BEFORE DELETE ON statping_task.service_groups 
-FOR EACH ROW EXECUTE FUNCTION statping_task.prevent_service_group_delete();
-
-COMMIT;
-TXNSQL
-
-echo "[+] Repair complete"
-
-# Verify all fixed
-INVALID=$(kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE -t -A -c \"SELECT COUNT(*) FROM statping_task.incidents WHERE service_group_id IS NULL OR service_group_id NOT IN (SELECT id FROM statping_task.service_groups)\"")
-[ "$INVALID" = "0" ] || (echo "[!] Verification failed" >&2; exit 1)
-
-# Test API
-HTTP=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18080/incidents \
-  -H "Content-Type: application/json" -d '{"service_group_id":2,"summary":"test"}' 2>/dev/null || echo "000")
-[ "$HTTP" = "201" ] || (echo "[!] API test failed" >&2; exit 1)
-
-echo "[✓] Repair verified - incident creation functional"
+echo "[✓] Solution applied"
 exit 0

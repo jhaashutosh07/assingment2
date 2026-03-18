@@ -2,222 +2,336 @@
 set -euo pipefail
 trap 'echo "[!] Setup failed at line ${LINENO}" >&2; exit 1' ERR
 
-NAMESPACE="bleater"
+NAMESPACE="fanout"
+
+# ── 1. Create namespace ──────────────────────────────────────────────────────
 kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+echo "[✓] Namespace $NAMESPACE ready"
 
-echo "[*] Waiting for PostgreSQL pod..."
-PG_POD=""
-for i in {1..60}; do
-  PG_POD=$(kubectl -n "$NAMESPACE" get pods -o name 2>/dev/null | grep postgres | head -1 | cut -d/ -f2)
-  [ -n "$PG_POD" ] && break
-  sleep 1
-done
-
-[ -n "$PG_POD" ] || { echo "[!] PostgreSQL pod not found" >&2; exit 1; }
-
-PSQL_BASE="PGPASSWORD=bleater psql -U bleater -d bleater -q"
-
-echo "[*] Waiting for PostgreSQL to accept connections..."
-for i in {1..60}; do
-  kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "PGPASSWORD=bleater pg_isready -U bleater -d bleater -q" 2>/dev/null && break
-  sleep 2
-done
-
-kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "PGPASSWORD=bleater pg_isready -U bleater -d bleater -q" || {
-  echo "[!] PostgreSQL not accepting connections" >&2; exit 1
-}
-
-cat > /tmp/statping_task.env <<EOF
-NAMESPACE=$NAMESPACE
-PG_POD=$PG_POD
-PSQL_BASE=$PSQL_BASE
+# ── 2. Deploy RabbitMQ ───────────────────────────────────────────────────────
+kubectl -n "$NAMESPACE" apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq
+  namespace: fanout
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3.12-management
+        ports:
+        - containerPort: 5672
+        - containerPort: 15672
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          value: guest
+        - name: RABBITMQ_DEFAULT_PASS
+          value: guest
+        readinessProbe:
+          httpGet:
+            path: /api/overview
+            port: 15672
+          initialDelaySeconds: 20
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 12
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq
+  namespace: fanout
+spec:
+  selector:
+    app: rabbitmq
+  ports:
+  - name: amqp
+    port: 5672
+    targetPort: 5672
+  - name: management
+    port: 15672
+    targetPort: 15672
 EOF
+echo "[✓] RabbitMQ Deployment + Service created"
 
-echo "[*] Generating randomized scenario..."
-ORPHAN_TOTAL=$((100 + RANDOM % 101))
-NULL_COUNT=$((10 + RANDOM % 21))
-SG1_COUNT=$((ORPHAN_TOTAL / 3))
-SG3_COUNT=$((ORPHAN_TOTAL / 3))
-SG4_COUNT=$((ORPHAN_TOTAL - SG1_COUNT - SG3_COUNT))
+# ── 3. Create fanout-config ConfigMap ────────────────────────────────────────
+kubectl -n "$NAMESPACE" create configmap fanout-config \
+  --from-literal='queues.conf=fanout.main
+fanout.secondary' \
+  --from-literal='exchanges.conf=fanout.exchange
+fanout.dlx' \
+  --dry-run=client -o yaml | kubectl apply -f -
+echo "[✓] fanout-config ConfigMap created"
 
-echo "[*] Creating database schema and broken state..."
+# ── 4. Create fanout-init-script ConfigMap (broken — no empty-file guard) ───
+kubectl -n "$NAMESPACE" create configmap fanout-init-script \
+  --from-literal='validate-config.sh=#!/bin/sh
+# Broken: no guard for empty files
+echo "[init] queues.conf: $(cat /config/queues.conf)"
+echo "[init] exchanges.conf: $(cat /config/exchanges.conf)"
+echo "[init] Validation complete (no empty-file guard)"
+exit 0
+' \
+  --dry-run=client -o yaml | kubectl apply -f -
+echo "[✓] fanout-init-script ConfigMap created (broken)"
 
-# Create schema and base tables
-kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE" <<'SCHEMA_SQL'
+# ── 5. Create task_baseline ConfigMap ────────────────────────────────────────
+kubectl -n "$NAMESPACE" create configmap task-baseline \
+  --from-literal=dlq_expected=0 \
+  --dry-run=client -o yaml | kubectl apply -f -
+echo "[✓] task_baseline ConfigMap created"
 
-DROP SCHEMA IF EXISTS statping_task CASCADE;
-CREATE SCHEMA statping_task;
+# ── 6. Deploy fanout-service with broken projected volume + init container ───
+kubectl -n "$NAMESPACE" apply -f - <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fanout-service
+  namespace: fanout
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fanout-service
+  template:
+    metadata:
+      labels:
+        app: fanout-service
+    spec:
+      initContainers:
+      - name: config-validator
+        image: busybox:1.36
+        command: ["/bin/sh", "/init/validate-config.sh"]
+        volumeMounts:
+        - name: fanout-projected
+          mountPath: /config
+        - name: fanout-init-script
+          mountPath: /init
+      containers:
+      - name: fanout-app
+        image: busybox:1.36
+        command: ["sh", "-c", "while true; do sleep 30; done"]
+        volumeMounts:
+        - name: fanout-projected
+          mountPath: /config
+      volumes:
+      - name: fanout-projected
+        projected:
+          sources:
+          - configMap:
+              name: fanout-config
+              items:
+              - key: queues.conf
+                path: queues.conf
+              - key: exchanges.conf
+                path: exchanges.conf
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3607
+      - name: fanout-init-script
+        configMap:
+          name: fanout-init-script
+          defaultMode: 0755
+EOF
+echo "[✓] fanout-service Deployment created"
 
--- Service groups table (only 2 and 5 exist; 1, 3, 4 were deleted)
-CREATE TABLE statping_task.service_groups (
-  id INT PRIMARY KEY,
-  name TEXT NOT NULL
-);
+# ── 7. Wait for first pod to be Running ─────────────────────────────────────
+echo "[*] Waiting for fanout-service pod to be Running (initial)..."
+for i in $(seq 1 60); do
+  POD_PHASE=$(kubectl -n "$NAMESPACE" get pods -l app=fanout-service \
+    -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+  [ "$POD_PHASE" = "Running" ] && break
+  sleep 3
+done
+POD_PHASE=$(kubectl -n "$NAMESPACE" get pods -l app=fanout-service \
+  -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+[ "$POD_PHASE" = "Running" ] || { echo "[!] fanout-service pod not Running" >&2; exit 1; }
+echo "[✓] fanout-service initial pod is Running"
 
-INSERT INTO statping_task.service_groups VALUES
-  (2, 'valid-group'),
-  (5, 'unreferenced-group');
+# ── 8. Inject broken state: patch fanout-config to empty values ──────────────
+echo "[*] Injecting broken state: emptying fanout-config values..."
+kubectl -n "$NAMESPACE" patch configmap fanout-config \
+  --type merge \
+  -p '{"data":{"queues.conf":"","exchanges.conf":""}}'
+echo "[✓] fanout-config patched to empty values (race injected)"
 
--- Incidents table with broken references
-CREATE TABLE statping_task.incidents (
-  id SERIAL PRIMARY KEY,
-  service_group_id INT,
-  summary TEXT NOT NULL,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
+# ── 9. Rolling restart so new pod starts with empty ConfigMap ────────────────
+echo "[*] Triggering rolling restart of fanout-service..."
+kubectl -n "$NAMESPACE" rollout restart deployment/fanout-service
+kubectl -n "$NAMESPACE" rollout status deployment/fanout-service --timeout=120s
+echo "[✓] Rolling restart complete"
 
--- Baseline data (must be preserved)
-CREATE TABLE statping_task.uptime_history (
-  id SERIAL PRIMARY KEY,
-  service_name TEXT,
-  status TEXT
-);
+# ── 10. Capture init log for the restarted pod ───────────────────────────────
+NEW_POD=$(kubectl -n "$NAMESPACE" get pods -l app=fanout-service \
+  --sort-by=.metadata.creationTimestamp \
+  -o jsonpath='{.items[-1].metadata.name}')
+kubectl -n "$NAMESPACE" logs "$NEW_POD" -c config-validator \
+  > /tmp/fanout_init_log.txt 2>/dev/null || true
+echo "[✓] Init container log captured: /tmp/fanout_init_log.txt"
 
-INSERT INTO statping_task.uptime_history (service_name, status) VALUES
-  ('fanout-service', 'degraded'),
-  ('fanout-service', 'ok');
+# ── 11. Write environment info ────────────────────────────────────────────────
+cat > /tmp/fanout_task.env <<EOF
+NAMESPACE=fanout
+RABBITMQ_URL=http://127.0.0.1:15672
+RABBITMQ_USER=guest
+RABBITMQ_PASS=guest
+EOF
+echo "[✓] Environment written to /tmp/fanout_task.env"
 
-CREATE TABLE statping_task.task_baseline (
-  key TEXT PRIMARY KEY,
-  value TEXT
-);
+# ── 12. Port-forward RabbitMQ management API ─────────────────────────────────
+echo "[*] Port-forwarding RabbitMQ management port..."
+# Wait for RabbitMQ pod to be ready first
+for i in $(seq 1 60); do
+  RMQP=$(kubectl -n "$NAMESPACE" get pods -l app=rabbitmq \
+    -o jsonpath='{.items[0].status.phase}' 2>/dev/null || true)
+  [ "$RMQP" = "Running" ] && break
+  sleep 3
+done
 
-INSERT INTO statping_task.task_baseline (key, value) VALUES ('uptime_count', '2');
+kubectl -n "$NAMESPACE" port-forward svc/rabbitmq 15672:15672 \
+  >/tmp/rabbitmq_pf.log 2>&1 &
+PF_PID=$!
+echo "[*] Port-forward PID: $PF_PID"
 
--- Legacy trigger that must be removed
-CREATE FUNCTION statping_task.legacy_block_delete()
-RETURNS TRIGGER LANGUAGE plpgsql AS $$
-BEGIN
-  RAISE EXCEPTION 'Legacy protection';
-END;
-$$;
+# Wait for RabbitMQ management API to be available
+echo "[*] Waiting for RabbitMQ management API..."
+for i in $(seq 1 40); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+    -u guest:guest http://127.0.0.1:15672/api/overview 2>/dev/null || true)
+  [ "$STATUS" = "200" ] && break
+  sleep 3
+done
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+  -u guest:guest http://127.0.0.1:15672/api/overview 2>/dev/null || true)
+[ "$STATUS" = "200" ] || { echo "[!] RabbitMQ management API not available" >&2; exit 1; }
+echo "[✓] RabbitMQ management API ready"
 
-CREATE TRIGGER legacy_delete_trigger
-BEFORE DELETE ON statping_task.service_groups
-FOR EACH ROW EXECUTE FUNCTION statping_task.legacy_block_delete();
+# ── 13. Pre-create fanout.dlq and publish 5 messages (simulate DLQ depth) ───
+echo "[*] Creating fanout.dlq queue..."
+curl -s -u guest:guest -X PUT http://127.0.0.1:15672/api/queues/%2F/fanout.dlq \
+  -H "content-type: application/json" \
+  -d '{"durable": true}' >/dev/null
 
-SCHEMA_SQL
-rc=$?
-[ $rc -eq 0 ] || { echo "[!] Schema creation failed (exit $rc)" >&2; exit 1; }
+echo "[*] Publishing 5 messages to fanout.dlq..."
+for i in 1 2 3 4 5; do
+  curl -s -u guest:guest -X POST \
+    http://127.0.0.1:15672/api/exchanges/%2F/amq.default/publish \
+    -H "content-type: application/json" \
+    -d "{\"properties\":{},\"routing_key\":\"fanout.dlq\",\"payload\":\"dropped-message-${i}\",\"payload_encoding\":\"string\"}" \
+    >/dev/null
+done
+echo "[✓] 5 messages published to fanout.dlq"
 
-# Insert orphaned and NULL incidents (variables substituted here)
-cat > /tmp/orphans.sql <<ORPHAN_INSERT
-INSERT INTO statping_task.incidents (service_group_id, summary) 
-SELECT 1, 'orphan-sg1-' || i FROM generate_series(1, $SG1_COUNT) AS i;
-
-INSERT INTO statping_task.incidents (service_group_id, summary)
-SELECT 3, 'orphan-sg3-' || i FROM generate_series(1, $SG3_COUNT) AS i;
-
-INSERT INTO statping_task.incidents (service_group_id, summary)
-SELECT 4, 'orphan-sg4-' || i FROM generate_series(1, $SG4_COUNT) AS i;
-
-INSERT INTO statping_task.incidents (service_group_id, summary)
-SELECT NULL, 'null-incident-' || i FROM generate_series(1, $NULL_COUNT) AS i;
-ORPHAN_INSERT
-
-kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "$PSQL_BASE" < /tmp/orphans.sql
-rc=$?
-[ $rc -eq 0 ] || { echo "[!] Orphan insert failed (exit $rc)" >&2; exit 1; }
-rm -f /tmp/orphans.sql
-
-echo "[✓] Created broken state: $ORPHAN_TOTAL orphans, $NULL_COUNT NULLs"
-
-pg_query() {
-  kubectl -n "$NAMESPACE" exec "$PG_POD" -- sh -c "PGPASSWORD=bleater psql -U bleater -d bleater -q -t -A -c \"$1\"" 2>/dev/null
-}
-
-echo "[*] Verifying setup..."
-SCHEMA_CHECK=$(pg_query "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'statping_task'")
-[ "$SCHEMA_CHECK" = "1" ] || { echo "[!] Schema verification failed" >&2; exit 1; }
-
-TABLE_CHECK=$(pg_query "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'statping_task' AND table_name IN ('incidents','service_groups','uptime_history','task_baseline')")
-[ "$TABLE_CHECK" = "4" ] || { echo "[!] Table verification failed: expected 4, got $TABLE_CHECK" >&2; exit 1; }
-
-ORPHAN_CHECK=$(pg_query "SELECT COUNT(*) FROM statping_task.incidents WHERE service_group_id IS NULL OR service_group_id NOT IN (SELECT id FROM statping_task.service_groups)")
-echo "[✓] Setup verified: schema exists, $TABLE_CHECK/4 tables present, $ORPHAN_CHECK orphans created"
-
-TRIGGER_CHECK=$(pg_query "SELECT COUNT(*) FROM pg_trigger WHERE tgname = 'legacy_delete_trigger'")
-[ "$TRIGGER_CHECK" = "1" ] || { echo "[!] Legacy trigger verification failed" >&2; exit 1; }
-echo "[✓] Legacy trigger confirmed present"
-
-# Start API server
-cat > /tmp/api.py <<'PYTHON_API'
+# ── 14. Start status API server (ThreadingHTTPServer) ────────────────────────
+cat > /tmp/fanout_api.py <<'PYTHON_API'
 #!/usr/bin/env python3
 import json, subprocess, sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-env = {}
-with open('/tmp/statping_task.env') as f:
-    for line in f:
-        if '=' in line:
-            k, v = line.strip().split('=', 1)
-            env[k] = v
+RABBITMQ_BASE = "http://127.0.0.1:15672"
+RABBITMQ_AUTH = "Basic Z3Vlc3Q6Z3Vlc3Q="  # guest:guest
 
-def psql(sql):
-    cmd = f"kubectl exec -n {env['NAMESPACE']} {env['PG_POD']} -- sh -c '{env['PSQL_BASE']} -t -A -c \"{sql}\"'"
+def get_dlq_depth():
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
-        return p.returncode == 0, p.stdout.strip()
-    except:
-        return False, ""
+        req = urllib.request.Request(
+            f"{RABBITMQ_BASE}/api/queues/%2F/fanout.dlq",
+            headers={"Authorization": RABBITMQ_AUTH}
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode())
+            return int(data.get("messages", 0))
+    except Exception:
+        return 0
+
+def get_init_guard():
+    try:
+        result = subprocess.run(
+            ["kubectl", "-n", "fanout", "get", "configmap", "fanout-init-script",
+             "-o", "jsonpath={.data.validate-config\\.sh}"],
+            capture_output=True, text=True, timeout=10
+        )
+        return "-s /config/queues.conf" in result.stdout
+    except Exception:
+        return False
+
+def get_pod_starts():
+    try:
+        with open("/tmp/fanout_init_log.txt") as f:
+            log = f.read()
+        import re
+        nonempty = bool(re.search(r'queues\.conf:\s+\S', log))
+        return [{"pod": "latest", "init_exit_code": 0, "config_nonempty": nonempty}]
+    except Exception:
+        return []
 
 class Handler(BaseHTTPRequestHandler):
     def _json(self, code, data):
+        body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-
-    def do_POST(self):
-        if self.path != "/incidents":
-            return self._json(404, {"error": "not found"})
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(length)) if length else {}
-            gid = body.get("service_group_id")
-            summary = body.get("summary", "").replace("'", "''")
-            if gid is None or not summary:
-                return self._json(400, {"error": "missing fields"})
-            ok, out = psql(f"INSERT INTO statping_task.incidents(service_group_id,summary) VALUES({int(gid)},'{summary}') RETURNING id;")
-            if not ok:
-                return self._json(500, {"error": "constraint violation"})
-            return self._json(201, {"id": int(out), "service_group_id": gid, "summary": summary})
-        except:
-            return self._json(400, {"error": "bad request"})
+        self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/incidents":
-            ok, out = psql("SELECT id, service_group_id, summary FROM statping_task.incidents ORDER BY id DESC LIMIT 200;")
-            rows = []
-            for line in out.splitlines():
-                try:
-                    p = line.split("|", 2)
-                    rows.append({"id": int(p[0]), "service_group_id": int(p[1]) if p[1] else None, "summary": p[2] if len(p) > 2 else ""})
-                except:
-                    pass
-            return self._json(200, rows)
-        elif self.path == "/status":
-            return self._json(200, {"status": "ok"})
-        return self._json(404, {})
+        if self.path == "/status":
+            return self._json(200, {
+                "status": "ok",
+                "dlq_depth": get_dlq_depth(),
+                "init_guard": get_init_guard(),
+            })
+        elif self.path == "/pod-starts":
+            return self._json(200, get_pod_starts())
+        return self._json(404, {"error": "not found"})
 
     def log_message(self, *a):
         pass
 
 try:
-    HTTPServer(("127.0.0.1", 18080), Handler).serve_forever()
-except:
+    server = ThreadingHTTPServer(("127.0.0.1", 18080), Handler)
+    server.serve_forever()
+except Exception as e:
+    print(f"Server error: {e}", file=sys.stderr)
     sys.exit(1)
 PYTHON_API
 
-nohup python3 /tmp/api.py >/tmp/api.log 2>&1 &
-
-echo "[*] Waiting for API server to be ready..."
-for i in {1..15}; do
+nohup python3 /tmp/fanout_api.py >/tmp/fanout_api.log 2>&1 &
+echo "[*] Waiting for status API server to be ready..."
+for i in $(seq 1 15); do
   curl -sf http://127.0.0.1:18080/status >/dev/null 2>&1 && break
   sleep 1
 done
-curl -sf http://127.0.0.1:18080/status >/dev/null 2>&1 || { echo "[!] API server failed to start" >&2; exit 1; }
-echo "[✓] API server ready"
+curl -sf http://127.0.0.1:18080/status >/dev/null 2>&1 || \
+  { echo "[!] Status API server failed to start" >&2; exit 1; }
+echo "[✓] Status API server ready at http://127.0.0.1:18080"
 
-echo "[✓] Setup complete"
+# ── 15. Verify setup ──────────────────────────────────────────────────────────
+echo "[*] Verifying setup..."
+kubectl get namespace "$NAMESPACE" >/dev/null
+kubectl -n "$NAMESPACE" get configmap fanout-config >/dev/null
+kubectl -n "$NAMESPACE" get configmap fanout-init-script >/dev/null
+kubectl -n "$NAMESPACE" get deployment fanout-service >/dev/null
+
+SCRIPT=$(kubectl -n "$NAMESPACE" get configmap fanout-init-script \
+  -o jsonpath='{.data.validate-config\.sh}' 2>/dev/null || true)
+if echo "$SCRIPT" | grep -q '\-s /config/queues.conf'; then
+  echo "[!] validate-config.sh already contains guard — broken state not injected!" >&2
+  exit 1
+fi
+echo "[✓] Broken state confirmed: validate-config.sh has no empty-file guard"
+
+curl -sf http://127.0.0.1:18080/status >/dev/null 2>&1
+echo "[✓] API server responds to GET /status"
+
+echo "[✓] Setup complete — fanout-configmap-race task ready"
 exit 0
