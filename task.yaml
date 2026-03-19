@@ -1,86 +1,70 @@
 id: fanout-configmap-race
 
 prompt: |
-  [PRODUCTION INCIDENT: fanout-service ConfigMap Init Container Race Condition]
+  [PRODUCTION INCIDENT: fanout-service multi-fault degradation]
 
   Issue: #627
   Severity: CRITICAL
 
-  During a recent platform migration, fanout-service was updated to use a projected volume
-  combining a ConfigMap (queue topology config) with a ServiceAccount token. Under this
-  projected volume, the init container intermittently starts before kubelet has fully
-  propagated the ConfigMap data. The config files exist in the mount point but are empty
-  or zero-byte. The init container validation script does not guard against empty files
-  and proceeds, so the main container starts with a partially initialized RabbitMQ queue
-  topology. Consumers bind to wrong exchanges and messages are silently routed to the
-  dead letter queue.
+  The fanout-service is degraded: messages are accumulating in the dead letter queue
+  (fanout.dlq) and the DLQ depth is growing. Multiple contributing faults are present.
+  Your job is to diagnose all root causes and repair them.
 
   [Broken State]
   - Namespace: fanout
   - fanout-service Deployment uses a projected volume combining ConfigMap and ServiceAccount token
-  - Init container (name: config-validator) validation script (/init/validate-config.sh)
-    does NOT check for empty/zero-byte files
-  - ConfigMap 'fanout-config' contains: queues.conf and exchanges.conf
-  - A synthetic race is injected: fanout-config has been patched to empty values
-    (queues.conf="" and exchanges.conf=""), so the init container reads empty files
-  - Dead letter queue depth is non-zero (5 messages dropped)
+  - Init container (name: config-validator) runs /init/validate-config.sh on startup
+  - ConfigMap 'fanout-config' (queues.conf, exchanges.conf) is the source of RabbitMQ topology
+  - Dead letter queue (fanout.dlq) depth is non-zero and growing over time
   - task-baseline ConfigMap contains grader baseline values (DO NOT modify)
 
   [Environment]
   - Kubernetes namespace: fanout
   - fanout-service Deployment: kubectl -n fanout get deploy fanout-service
-  - ConfigMap to fix: kubectl -n fanout get configmap fanout-config
+  - ConfigMap to inspect/fix: kubectl -n fanout get configmap fanout-config
   - Init container name: config-validator
     View logs: kubectl -n fanout logs <pod> -c config-validator
   - Init script ConfigMap (you CAN modify this): fanout-init-script
     Key: validate-config.sh
-  - The correct values for fanout-config must be discovered from the environment —
-    inspect the 'fanout-config-backup' ConfigMap for the original values
+  - The original config values may be recoverable from ConfigMap annotations
   - RabbitMQ management API: http://127.0.0.1:15672 (credentials: guest / guest)
   - Dead letter queue: fanout.dlq
+  - RabbitMQ topology info: kubectl -n fanout get configmap fanout-exchange-config -o yaml
+  - Binding creation: POST http://127.0.0.1:15672/api/bindings/%2F/e/{exchange}/q/{queue}
+  - Drain DLQ: DELETE http://127.0.0.1:15672/api/queues/%2F/fanout.dlq/contents
   - Status API: http://127.0.0.1:18080
-    GET /status → {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
-      init_guard=true means validate-config.sh contains a non-empty file guard for queues.conf
+    GET /status returns operational status
     GET /pod-starts → informational only, not graded
   - task-baseline ConfigMap (name: task-baseline, key: dlq_expected=0) must NOT be modified
 
   [Key Environment Facts]
   - Init container name: config-validator (e.g. kubectl -n fanout logs <pod> -c config-validator)
-  - To find the correct fanout-config values, inspect: kubectl -n fanout get configmap fanout-config-backup -o yaml
-  - GET /status returns {"status": "ok", "dlq_depth": <int>, "init_guard": <bool>}
-      init_guard=true means validate-config.sh contains a non-empty file guard for queues.conf
+  - The original config values may be recoverable from ConfigMap annotations
+  - GET /status returns operational status
   - GET /pod-starts is informational only (not graded)
   - task-baseline ConfigMap (name: task-baseline) must NOT be modified
       It contains: dlq_expected=0
 
   [Your Mission]
 
-  1. Diagnose: Examine init container logs across multiple pod restarts; confirm the race
-     condition by observing empty config file content in init container logs.
+  1. Diagnose: Determine why fanout-service is dropping messages into the dead letter queue.
+     There are multiple contributing faults — find all of them.
 
-  2. Restore fanout-config: Patch the 'fanout-config' ConfigMap to restore the correct
-     non-empty values — inspect the 'fanout-config-backup' ConfigMap for the original values
+  2. Repair: Fix all identified faults so that:
+     - The init container validates config files correctly before proceeding
+     - The fanout-config ConfigMap has the correct non-empty values
+     - RabbitMQ message routing is restored (no new messages going to DLQ)
+     - The DLQ is drained to 0
 
-  3. Fix the init container guard: Update the 'fanout-init-script' ConfigMap so that
-     validate-config.sh retries reading queues.conf and exchanges.conf until both files
-     are non-empty (up to 60 seconds before giving up). Exit 0 immediately once both
-     files are non-empty. Exit 1 if the timeout is reached.
-
-  4. Separate volume mounts (optional, not graded): Split the projected volume into two
-     separate volumes — one plain ConfigMap volume for 'fanout-config' and one projected
-     volume for the ServiceAccount token only — to eliminate the race at the kubelet level.
-
-  5. Verify: Trigger a rolling restart of fanout-service. Confirm init container exits 0
-     consistently. Confirm dead letter queue depth returns to 0.
-     Drain the DLQ: DELETE http://127.0.0.1:15672/api/queues/%2F/fanout.dlq/contents
+  3. Verify: Confirm fanout-service restarts cleanly and the system is stable.
 
   [Success Criteria]
-  - Init container script retries until config files are non-empty (guard logic present,
-    checking BOTH queues.conf AND exchanges.conf with a sleep-based retry loop)
-  - fanout-service pods restart with init container ExitCode 0
-  - Init container logs show non-empty content for both queues.conf and exchanges.conf
-  - Dead letter queue depth for fanout.dlq is 0
-  - task-baseline ConfigMap (task-baseline) unchanged (dlq_expected must remain "0")
+  - Init container exits 0 consistently across rolling restarts
+  - fanout-config contains the correct topology values
+  - No new messages are routed to the dead letter queue
+  - fanout.dlq depth is 0
+  - RabbitMQ exchange binding is correctly configured
+  - task-baseline ConfigMap is unchanged
 
 metadata:
   category: platform-eng

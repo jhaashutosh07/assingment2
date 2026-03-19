@@ -14,13 +14,22 @@ cat > /tmp/mock_rabbitmq.py <<'MOCK_RMQAPI'
 """
 Minimal mock of the RabbitMQ management HTTP API.
 Implements only the endpoints used by setup.sh, grader.py, and the agent.
-DLQ depth starts at 5 (simulating dropped messages); purge sets it to 0.
+DLQ depth starts at 5 and accumulates over time until the
+fanout.exchange->fanout.main binding is created.
 """
 import json
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
-_dlq_depth = 5
+_bindings = [
+    {"source": "fanout.exchange", "destination": "fanout.dlq", "destination_type": "queue", "routing_key": ""},
+    # fanout.exchange -> fanout.main is intentionally MISSING
+]
+_dlq_accumulate = True
+_base_depth = 5
+_start_time = time.time()
+_bindings_lock = threading.Lock()
 _dlq_lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
@@ -36,14 +45,31 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self):
-        global _dlq_depth
         if self.path in ("/api/overview", "/api/overview/"):
             data = json.dumps({"rabbitmq_version": "3.12.0-mock", "management_version": "3.12.0"}).encode()
             return self._reply(200, data)
+        if self.path == "/api/bindings/%2F":
+            with _bindings_lock:
+                data = json.dumps(_bindings).encode()
+            return self._reply(200, data)
+        if self.path.startswith("/api/bindings/%2F/e/") and "/q/" in self.path:
+            parts = self.path.split("/q/")
+            exchange = parts[0].split("/e/")[1]
+            queue = parts[1]
+            with _bindings_lock:
+                found = any(b["source"] == exchange and b["destination"] == queue for b in _bindings)
+            if found:
+                data = json.dumps({"source": exchange, "destination": queue}).encode()
+                return self._reply(200, data)
+            return self._reply(404, b'{"error":"not_found"}')
         if self.path == "/api/queues/%2F/fanout.dlq":
             with _dlq_lock:
-                depth = _dlq_depth
-            data = json.dumps({"name": "fanout.dlq", "messages": depth, "durable": True}).encode()
+                if _dlq_accumulate:
+                    elapsed = int(time.time() - _start_time)
+                    current_depth = _base_depth + (elapsed // 10)
+                else:
+                    current_depth = _base_depth
+            data = json.dumps({"name": "fanout.dlq", "messages": current_depth, "durable": True}).encode()
             return self._reply(200, data)
         self._reply(404, b'{"error":"not_found"}')
 
@@ -56,6 +82,25 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(404, b'{"error":"not_found"}')
 
     def do_POST(self):
+        global _dlq_accumulate, _base_depth
+        if self.path.startswith("/api/bindings/%2F/e/") and "/q/" in self.path:
+            parts = self.path.split("/q/")
+            exchange = parts[0].split("/e/")[1]
+            queue = parts[1]
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            new_binding = {"source": exchange, "destination": queue, "destination_type": "queue", "routing_key": ""}
+            with _bindings_lock:
+                if not any(b["source"] == exchange and b["destination"] == queue for b in _bindings):
+                    _bindings.append(new_binding)
+            if exchange == "fanout.exchange" and queue == "fanout.main":
+                with _dlq_lock:
+                    if _dlq_accumulate:
+                        elapsed = int(time.time() - _start_time)
+                        _base_depth = _base_depth + (elapsed // 10)
+                        _dlq_accumulate = False
+            return self._reply(201, b'{}')
         length = int(self.headers.get("Content-Length", 0))
         if length:
             self.rfile.read(length)
@@ -64,10 +109,10 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(404, b'{"error":"not_found"}')
 
     def do_DELETE(self):
-        global _dlq_depth
+        global _base_depth
         if "fanout.dlq/contents" in self.path:
             with _dlq_lock:
-                _dlq_depth = 0
+                _base_depth = 0
             return self._reply(204)
         self._reply(404, b'{"error":"not_found"}')
 
@@ -98,26 +143,37 @@ fanout.dlx' \
   --dry-run=client -o yaml | kubectl apply -f -
 echo "[✓] fanout-config ConfigMap created"
 
-# ── 4b. Create fanout-config-backup (correct values — agent must discover this) ──
-kubectl -n "$NAMESPACE" create configmap fanout-config-backup \
-  --from-literal='queues.conf=fanout.main
-fanout.secondary' \
-  --from-literal='exchanges.conf=fanout.exchange
-fanout.dlx' \
-  --dry-run=client -o yaml | kubectl apply -f -
-echo "[✓] fanout-config-backup ConfigMap created"
+# ── 3b. Annotate fanout-config with base64-encoded correct values ─────────────
+QUEUES_B64=$(printf 'fanout.main\nfanout.secondary' | base64 | tr -d '\n')
+EXCHANGES_B64=$(printf 'fanout.exchange\nfanout.dlx' | base64 | tr -d '\n')
+kubectl -n "$NAMESPACE" annotate configmap fanout-config \
+  "fanout.io/config-snapshot={\"queues\":\"${QUEUES_B64}\",\"exchanges\":\"${EXCHANGES_B64}\"}" \
+  --overwrite
+echo "[✓] fanout-config annotated with base64 snapshot"
 
-# ── 5. Create fanout-init-script ConfigMap (broken — no empty-file guard) ───
+# ── 4. Create fanout-exchange-config ConfigMap (topology hint) ────────────────
+kubectl -n "$NAMESPACE" create configmap fanout-exchange-config \
+  --from-literal='topology.json={"exchanges":["fanout.exchange","fanout.dlx"],"queues":["fanout.main","fanout.secondary","fanout.dlq"],"bindings":[{"source":"fanout.exchange","destination":"fanout.dlq"}]}' \
+  --dry-run=client -o yaml | kubectl apply -f -
+echo "[✓] fanout-exchange-config ConfigMap created"
+
+# ── 5. Create fanout-init-script ConfigMap (broken — dead-code guard) ─────────
 kubectl -n "$NAMESPACE" create configmap fanout-init-script \
   --from-literal='validate-config.sh=#!/bin/sh
-# Broken: no guard for empty files
 echo "[init] queues.conf: $(cat /config/queues.conf)"
 echo "[init] exchanges.conf: $(cat /config/exchanges.conf)"
-echo "[init] Validation complete (no empty-file guard)"
 exit 0
+# Dead code below — guard never runs
+for i in $(seq 1 30); do
+  if [ -s /config/queues.conf ] && [ -s /config/exchanges.conf ]; then
+    exit 0
+  fi
+  sleep 2
+done
+exit 1
 ' \
   --dry-run=client -o yaml | kubectl apply -f -
-echo "[✓] fanout-init-script ConfigMap created (broken)"
+echo "[✓] fanout-init-script ConfigMap created (dead-code guard)"
 
 # ── 5. Create task_baseline ConfigMap ────────────────────────────────────────
 kubectl -n "$NAMESPACE" create configmap task-baseline \
@@ -264,12 +320,25 @@ def get_dlq_depth():
 
 def get_init_guard():
     try:
+        import re
         result = subprocess.run(
             ["kubectl", "-n", "fanout", "get", "configmap", "fanout-init-script",
              "-o", "jsonpath={.data.validate-config\\.sh}"],
             capture_output=True, text=True, timeout=10
         )
-        return "-s /config/queues.conf" in result.stdout
+        script = result.stdout
+        has_queue_guard = "/config/queues.conf" in script
+        has_exchange_guard = "/config/exchanges.conf" in script
+        has_retry = bool(re.search(r'sleep\s+[0-9]+', script))
+        if not (has_queue_guard and has_exchange_guard and has_retry):
+            return False
+        first_guard_pos = min(
+            (script.find("/config/queues.conf") if "/config/queues.conf" in script else len(script)),
+            (script.find("/config/exchanges.conf") if "/config/exchanges.conf" in script else len(script))
+        )
+        pre_guard = script[:first_guard_pos]
+        has_early_exit = bool(re.search(r'^\s*exit\s+0\s*$', pre_guard, re.MULTILINE))
+        return not has_early_exit
     except Exception:
         return False
 
@@ -333,11 +402,15 @@ kubectl -n "$NAMESPACE" get deployment fanout-service >/dev/null
 
 SCRIPT=$(kubectl -n "$NAMESPACE" get configmap fanout-init-script \
   -o jsonpath='{.data.validate-config\.sh}' 2>/dev/null || true)
-if echo "$SCRIPT" | grep -q '\-s /config/queues.conf'; then
-  echo "[!] validate-config.sh already contains guard — broken state not injected!" >&2
+# Verify dead-code state: standalone 'exit 0' must appear before any guard reference
+EXIT_LINE=$(echo "$SCRIPT" | grep -n '^exit 0$' | head -1 | cut -d: -f1)
+GUARD_LINE=$(echo "$SCRIPT" | grep -n '\-s /config/queues.conf' | head -1 | cut -d: -f1)
+if [ -n "$EXIT_LINE" ] && [ -n "$GUARD_LINE" ] && [ "$EXIT_LINE" -lt "$GUARD_LINE" ]; then
+  echo "[✓] Broken state confirmed: validate-config.sh has dead-code guard (exit 0 line ${EXIT_LINE}, guard line ${GUARD_LINE})"
+else
+  echo "[!] Broken state not confirmed: early exit 0 not before guard check" >&2
   exit 1
 fi
-echo "[✓] Broken state confirmed: validate-config.sh has no empty-file guard"
 
 curl -sf http://127.0.0.1:18080/status >/dev/null 2>&1
 echo "[✓] API server responds to GET /status"
