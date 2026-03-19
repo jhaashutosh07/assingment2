@@ -150,10 +150,25 @@ def check_2_init_exit_zero() -> Tuple[bool, str]:
 
 
 def check_3_config_restored() -> Tuple[bool, str]:
-    """fanout-config restored to canonical correct values?"""
-    EXPECTED_QUEUES = "fanout.main\nfanout.secondary"
-    EXPECTED_EXCHANGES = "fanout.exchange\nfanout.dlx"
+    """fanout-config restored to match fanout-config-backup values?"""
+    # Fetch backup (authoritative source — do not hard-code expected values)
+    rc_b, out_b = run_kubectl([
+        "-n", NAMESPACE, "get", "configmap", "fanout-config-backup", "-o", "json"
+    ])
+    if rc_b != 0:
+        return False, "fanout-config-backup not found"
+    try:
+        backup_data = json.loads(out_b).get("data", {})
+    except Exception:
+        return False, "failed to parse fanout-config-backup"
 
+    expected_queues = backup_data.get("queues.conf", "").strip()
+    expected_exchanges = backup_data.get("exchanges.conf", "").strip()
+
+    if not expected_queues or not expected_exchanges:
+        return False, "fanout-config-backup missing required keys"
+
+    # Fetch current fanout-config
     rc_c, out_c = run_kubectl([
         "-n", NAMESPACE, "get", "configmap", "fanout-config", "-o", "json"
     ])
@@ -168,14 +183,14 @@ def check_3_config_restored() -> Tuple[bool, str]:
     exchanges_actual = current_data.get("exchanges.conf", "").strip()
 
     problems = []
-    if queues_actual != EXPECTED_QUEUES:
+    if queues_actual != expected_queues:
         problems.append(f"queues.conf mismatch (got {repr(queues_actual[:40])})")
-    if exchanges_actual != EXPECTED_EXCHANGES:
+    if exchanges_actual != expected_exchanges:
         problems.append(f"exchanges.conf mismatch (got {repr(exchanges_actual[:40])})")
 
     if problems:
         return False, "; ".join(problems)
-    return True, "fanout-config values correct"
+    return True, "fanout-config matches backup"
 
 
 def check_4_dlq_depth_zero() -> Tuple[bool, str]:
