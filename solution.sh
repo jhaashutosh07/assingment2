@@ -4,13 +4,41 @@ trap 'echo "[!] Error at line ${LINENO}" >&2; exit 1' ERR
 
 NAMESPACE="fanout"
 
-# Step 1: Restore fanout-config to the exact non-empty values required by the grader.
-# queues.conf must contain "fanout.main\nfanout.secondary"
-# exchanges.conf must contain "fanout.exchange\nfanout.dlx"
-echo "[+] Step 1: Restore fanout-config to non-empty values..."
+# Step 1: Restore fanout-config from backup values stored in fanout-config-backup.
+echo "[+] Step 1: Restore fanout-config from backup values..."
+# Restore from backup values stored in fanout-config-backup
+QUEUES=""; EXCHANGES=""
+if kubectl -n "$NAMESPACE" get configmap fanout-config-backup >/dev/null 2>&1; then
+  QUEUES=$(kubectl -n "$NAMESPACE" get configmap fanout-config-backup \
+    -o jsonpath='{.data.queues\.conf}')
+  EXCHANGES=$(kubectl -n "$NAMESPACE" get configmap fanout-config-backup \
+    -o jsonpath='{.data.exchanges\.conf}')
+fi
+
+# Fall back to annotation-encoded snapshot if fanout-config-backup is absent
+if [ -z "$QUEUES" ] || [ -z "$EXCHANGES" ]; then
+  echo "[*] fanout-config-backup absent, decoding from annotation snapshot..."
+  _SNAP=$(kubectl -n "$NAMESPACE" get configmap fanout-config \
+    -o jsonpath='{.metadata.annotations.fanout\.io/config-snapshot}' 2>/dev/null || echo '{}')
+  QUEUES=$(printf '%s' "$_SNAP" | python3 -c \
+    "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['queues']).decode(),end='')" \
+    2>/dev/null) || true
+  EXCHANGES=$(printf '%s' "$_SNAP" | python3 -c \
+    "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['exchanges']).decode(),end='')" \
+    2>/dev/null) || true
+fi
+
+[ -n "$QUEUES" ] && [ -n "$EXCHANGES" ] || { echo "[!] Failed to discover config values" >&2; exit 1; }
+
+# Use Python to build properly-escaped JSON for the patch
+_PATCH=$(python3 -c "
+import json, sys
+print(json.dumps({'data': {'queues.conf': sys.argv[1], 'exchanges.conf': sys.argv[2]}}))
+" "$QUEUES" "$EXCHANGES")
+
 kubectl -n "$NAMESPACE" patch configmap fanout-config \
   --type merge \
-  -p '{"data":{"queues.conf":"fanout.main\nfanout.secondary","exchanges.conf":"fanout.exchange\nfanout.dlx"}}'
+  -p "$_PATCH"
 
 echo "[+] Step 2: Update fanout-init-script with guard logic..."
 kubectl -n "$NAMESPACE" create configmap fanout-init-script \
@@ -49,7 +77,13 @@ echo "[+] Step 4: Rolling restart to apply changes..."
 kubectl -n "$NAMESPACE" rollout restart deployment/fanout-service
 kubectl -n "$NAMESPACE" rollout status deployment/fanout-service --timeout=120s
 
-echo "[+] Step 5: Drain the dead letter queue..."
+echo "[+] Step 5: Create fanout.exchange → fanout.main binding in RabbitMQ..."
+curl -s -u guest:guest -X POST \
+  "http://127.0.0.1:15672/api/bindings/%2F/e/fanout.exchange/q/fanout.main" \
+  -H "content-type: application/json" \
+  -d '{}' > /dev/null
+
+echo "[+] Step 6: Drain the dead letter queue..."
 # Purge fanout.dlq via RabbitMQ management API.
 # This is required because the grader checks that fanout.dlq message count is 0.
 # The 5 messages accumulated during the broken state must be cleared after the fix is applied.
@@ -57,7 +91,7 @@ curl -s -u guest:guest -X DELETE \
   "http://127.0.0.1:15672/api/queues/%2F/fanout.dlq/contents" \
   -H "content-type: application/json" || true
 
-echo "[+] Step 6: Capture init container log..."
+echo "[+] Step 7: Capture init container log..."
 NEW_POD=$(kubectl -n "$NAMESPACE" get pods -l app=fanout-service \
   --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
 kubectl -n "$NAMESPACE" logs "$NEW_POD" -c config-validator > /tmp/fanout_init_log.txt 2>/dev/null || true
