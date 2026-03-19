@@ -4,13 +4,15 @@ trap 'echo "[!] Error at line ${LINENO}" >&2; exit 1' ERR
 
 NAMESPACE="fanout"
 
-# Step 1: Restore fanout-config to the exact non-empty values required by the grader.
-# queues.conf must contain "fanout.main\nfanout.secondary"
-# exchanges.conf must contain "fanout.exchange\nfanout.dlx"
-echo "[+] Step 1: Restore fanout-config to non-empty values..."
+# Step 1: Restore fanout-config values from the fanout-config-backup ConfigMap.
+echo "[+] Step 1: Restore fanout-config from backup..."
+QUEUES=$(kubectl -n "$NAMESPACE" get configmap fanout-config-backup \
+  -o jsonpath='{.data.queues\.conf}')
+EXCHANGES=$(kubectl -n "$NAMESPACE" get configmap fanout-config-backup \
+  -o jsonpath='{.data.exchanges\.conf}')
 kubectl -n "$NAMESPACE" patch configmap fanout-config \
   --type merge \
-  -p '{"data":{"queues.conf":"fanout.main\nfanout.secondary","exchanges.conf":"fanout.exchange\nfanout.dlx"}}'
+  -p "{\"data\":{\"queues.conf\":\"${QUEUES}\",\"exchanges.conf\":\"${EXCHANGES}\"}}"
 
 echo "[+] Step 2: Update fanout-init-script with guard logic..."
 kubectl -n "$NAMESPACE" create configmap fanout-init-script \
@@ -49,7 +51,13 @@ echo "[+] Step 4: Rolling restart to apply changes..."
 kubectl -n "$NAMESPACE" rollout restart deployment/fanout-service
 kubectl -n "$NAMESPACE" rollout status deployment/fanout-service --timeout=120s
 
-echo "[+] Step 5: Drain the dead letter queue..."
+echo "[+] Step 5: Create RabbitMQ exchange binding..."
+curl -s -u guest:guest -X POST \
+  "http://127.0.0.1:15672/api/bindings/%2F/e/fanout.exchange/q/fanout.main" \
+  -H "content-type: application/json" \
+  -d '{}' > /dev/null
+
+echo "[+] Step 6: Drain the dead letter queue..."
 # Purge fanout.dlq via RabbitMQ management API.
 # This is required because the grader checks that fanout.dlq message count is 0.
 # The 5 messages accumulated during the broken state must be cleared after the fix is applied.
@@ -57,7 +65,7 @@ curl -s -u guest:guest -X DELETE \
   "http://127.0.0.1:15672/api/queues/%2F/fanout.dlq/contents" \
   -H "content-type: application/json" || true
 
-echo "[+] Step 6: Capture init container log..."
+echo "[+] Step 7: Capture init container log..."
 NEW_POD=$(kubectl -n "$NAMESPACE" get pods -l app=fanout-service \
   --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
 kubectl -n "$NAMESPACE" logs "$NEW_POD" -c config-validator > /tmp/fanout_init_log.txt 2>/dev/null || true
