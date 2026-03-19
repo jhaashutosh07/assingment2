@@ -61,9 +61,8 @@ prompt: |
   [Success Criteria]
   - Init container exits 0 consistently across rolling restarts
   - fanout-config contains the correct topology values
-  - No new messages are routed to the dead letter queue
+  - RabbitMQ routing is fully restored
   - fanout.dlq depth is 0
-  - RabbitMQ exchange binding is correctly configured
   - task-baseline ConfigMap is unchanged
 
 metadata:
