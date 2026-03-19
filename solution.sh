@@ -51,9 +51,13 @@ echo "[+] Step 4: Rolling restart to apply changes..."
 kubectl -n "$NAMESPACE" rollout restart deployment/fanout-service
 kubectl -n "$NAMESPACE" rollout status deployment/fanout-service --timeout=120s
 
-echo "[+] Step 5: Create RabbitMQ exchange binding..."
+echo "[+] Step 5: Create RabbitMQ exchange bindings..."
 curl -s -u guest:guest -X POST \
   "http://127.0.0.1:15672/api/bindings/%2F/e/fanout.exchange/q/fanout.main" \
+  -H "content-type: application/json" \
+  -d '{}' > /dev/null
+curl -s -u guest:guest -X POST \
+  "http://127.0.0.1:15672/api/bindings/%2F/e/fanout.dlx/q/fanout.secondary" \
   -H "content-type: application/json" \
   -d '{}' > /dev/null
 
@@ -65,7 +69,10 @@ curl -s -u guest:guest -X DELETE \
   "http://127.0.0.1:15672/api/queues/%2F/fanout.dlq/contents" \
   -H "content-type: application/json" || true
 
-echo "[+] Step 7: Capture init container log..."
+echo "[+] Step 7: Apply validated label to fanout-config..."
+kubectl -n "$NAMESPACE" label configmap fanout-config fanout.io/validated=true --overwrite
+
+echo "[+] Step 8: Capture init container log..."
 NEW_POD=$(kubectl -n "$NAMESPACE" get pods -l app=fanout-service \
   --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
 kubectl -n "$NAMESPACE" logs "$NEW_POD" -c config-validator > /tmp/fanout_init_log.txt 2>/dev/null || true

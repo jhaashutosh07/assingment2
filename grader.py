@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Grader - PRIVATE (not accessible to agent)
-fanout-configmap-race: 6 checks, each weighted ~0.167
+fanout-configmap-race: 5 checks, each weighted 0.2
 """
 
 import os
@@ -193,78 +193,87 @@ def check_3_config_restored() -> Tuple[bool, str]:
     return True, "fanout-config matches backup"
 
 
-def check_4_dlq_depth_zero() -> Tuple[bool, str]:
-    """fanout.dlq message count is 0 AND init guard is functional (prevents gaming via direct purge)."""
-    # Verify guard is functional — prevents scoring by purging DLQ without fixing root cause
+def check_4_both_bindings_fixed() -> Tuple[bool, str]:
+    """Both fanout.exchange→fanout.main AND fanout.dlx→fanout.secondary bindings must exist."""
+    code, body = http_get(
+        "http://127.0.0.1:15672/api/bindings/%2F",
+        auth_header="Basic Z3Vlc3Q6Z3Vlc3Q="
+    )
+    if code != 200:
+        return False, f"RabbitMQ bindings API HTTP {code}"
+    try:
+        bindings = json.loads(body)
+    except Exception:
+        return False, "invalid bindings response"
+
+    has_main = any(
+        b.get("source") == "fanout.exchange" and b.get("destination") == "fanout.main"
+        for b in bindings
+    )
+    has_secondary = any(
+        b.get("source") == "fanout.dlx" and b.get("destination") == "fanout.secondary"
+        for b in bindings
+    )
+
+    missing = []
+    if not has_main:
+        missing.append("fanout.exchange->fanout.main")
+    if not has_secondary:
+        missing.append("fanout.dlx->fanout.secondary")
+
+    if missing:
+        return False, f"missing bindings: {', '.join(missing)}"
+    return True, "both bindings present"
+
+
+def check_5_config_verified_and_dlq_zero() -> Tuple[bool, str]:
+    """fanout.dlq depth is 0 AND fanout-config has label fanout.io/validated=true."""
+    # Guard must be fixed before DLQ depth counts — ensures agent fixed the root cause
     guard_ok, guard_msg = check_1_init_guard_functional()
     if not guard_ok:
-        return False, f"dlq purge without guard fix ({guard_msg})"
+        return False, f"guard not fixed ({guard_msg})"
 
+    # Check DLQ depth
     code, body = http_get(
         "http://127.0.0.1:15672/api/queues/%2F/fanout.dlq",
         auth_header="Basic Z3Vlc3Q6Z3Vlc3Q="
     )
     if code == 404:
-        return True, "dlq depth 0 (queue absent)"
-    if code != 200:
+        dlq_ok = True
+    elif code != 200:
         return False, f"RabbitMQ API HTTP {code}"
-    try:
-        data = json.loads(body)
-        depth = int(data.get("messages", -1))
-        if depth == 0:
-            return True, "dlq depth 0"
-        return False, f"dlq depth {depth}"
-    except Exception:
-        return False, "invalid RabbitMQ response"
-
-
-def check_5_exchange_binding_fixed() -> Tuple[bool, str]:
-    """fanout.exchange → fanout.main binding must exist in RabbitMQ."""
-    code, body = http_get(
-        "http://127.0.0.1:15672/api/bindings/%2F",
-        auth_header="Basic Z3Vlc3Q6Z3Vlc3Q="
-    )
-    if code == 200:
+    else:
         try:
-            bindings = json.loads(body)
-            for b in bindings:
-                if b.get("source") == "fanout.exchange" and b.get("destination") == "fanout.main":
-                    return True, "binding fanout.exchange->fanout.main exists"
-            return False, "binding fanout.exchange->fanout.main missing"
+            data = json.loads(body)
+            depth = int(data.get("messages", -1))
+            dlq_ok = (depth == 0)
+            if not dlq_ok:
+                return False, f"dlq depth {depth}"
         except Exception:
-            return False, "invalid bindings response"
-    # Fallback: try direct endpoint
-    code2, body2 = http_get(
-        "http://127.0.0.1:15672/api/bindings/%2F/e/fanout.exchange/q/fanout.main",
-        auth_header="Basic Z3Vlc3Q6Z3Vlc3Q="
-    )
-    if code2 == 200:
-        return True, "binding exists (direct check)"
-    return False, f"binding check failed (HTTP {code}, {code2})"
+            return False, "invalid RabbitMQ response"
 
-
-def check_6_task_baseline_intact() -> Tuple[bool, str]:
-    """task-baseline ConfigMap is unchanged (dlq_expected=0)."""
-    rc, val = run_kubectl([
-        "-n", NAMESPACE, "get", "configmap", "task-baseline",
-        "-o", "jsonpath={.data.dlq_expected}"
+    # Check fanout-config has label fanout.io/validated=true
+    # Note: kubectl jsonpath requires escaping '.' in label keys containing dots
+    rc, out = run_kubectl([
+        "-n", NAMESPACE, "get", "configmap", "fanout-config",
+        "-o", "jsonpath={.metadata.labels.fanout\\.io/validated}"
     ])
-    if rc != 0 or not val:
-        return False, "task-baseline ConfigMap missing or empty"
-    if val.strip() == "0":
-        return True, "task-baseline intact"
-    return False, f"task-baseline tampered: dlq_expected={val}"
+    if rc != 0:
+        return False, "fanout-config not found"
+    if out.strip() != "true":
+        return False, "fanout-config missing label fanout.io/validated=true"
+
+    return True, "dlq depth 0 and config labeled"
 
 
 def evaluate():
-    # 6 checks, each weighted ~0.167
+    # 5 checks, each weighted 0.2
     checks = {
         "init_guard_functional": check_1_init_guard_functional,
         "init_exit_zero": check_2_init_exit_zero,
         "config_restored": check_3_config_restored,
-        "dlq_depth_zero": check_4_dlq_depth_zero,
-        "exchange_binding_fixed": check_5_exchange_binding_fixed,
-        "task_baseline_intact": check_6_task_baseline_intact,
+        "both_bindings_fixed": check_4_both_bindings_fixed,
+        "config_verified_and_dlq_zero": check_5_config_verified_and_dlq_zero,
     }
 
     subscores = {}
@@ -279,7 +288,7 @@ def evaluate():
             subscores[name] = 0.0
             feedback.append(f"[{name}] error")
 
-    weights = {k: 1/6 for k in checks}
+    weights = {k: 1/5 for k in checks}
     score = sum(subscores.get(k, 0) * weights[k] for k in checks)
     return subscores, weights, " | ".join(feedback), score
 
